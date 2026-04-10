@@ -1,7 +1,7 @@
 {
   "domain": "sophia_nlu",
   "name": "Sophia NLU Engine",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "documentation": "https://nlu.to/ha/docs/",
   "issue_tracker": "https://git.nlu.to/aquila/sophia-ha-integration/issues",
   "requirements": [],
