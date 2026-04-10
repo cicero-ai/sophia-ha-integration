@@ -1,0 +1,17 @@
+{
+  "domain": "sophia_nlu",
+  "name": "Sophia NLU Engine",
+  "version": "1.0.0",
+  "documentation": "https://nlu.to/ha/docs/",
+  "issue_tracker": "https://git.nlu.to/aquila/sophia-ha-integration/issues",
+  "requirements": [],
+  "dependencies": ["conversation"],
+  "after_dependencies": ["assist_pipeline", "intent"],
+  "codeowners": ["@aquila-labs"],
+  "config_flow": true,
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "loggers": ["sophia_nlu"]
+}
+
+

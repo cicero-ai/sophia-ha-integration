@@ -1,0 +1,20 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Sophia NLU",
+        "description": "Enter the host and port of your Sophia NLU server.",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the Sophia NLU server. Please check the host and port."
+    },
+    "abort": {
+      "already_configured": "This Sophia NLU server is already configured."
+    }
+  }
+}
