@@ -1,21 +1,63 @@
-MIT License
 
-Copyright (c) 2026 cicero-ai
+# Sophia NLU Engine — Commercial End User License Agreement (EULA)
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+**Version:** 1.0  
+**Effective Date:** April 10, 2026  
+**Licensor:** Aquila Labs of Alberta, Canada  
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+**PLEASE READ THIS AGREEMENT CAREFULLY BEFORE INSTALLING OR USING THE SOFTWARE.**
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+### 1. Acceptance of Terms
+
+This End User License Agreement ("Agreement") is a legal contract between you ("Licensee") and Aquila Labs ("Licensor") for the Sophia NLU Engine Home Assistant Edition, including any associated binaries, libraries, and documentation (collectively, the "Software"). By installing, copying, or otherwise using the Software, you agree to be bound by this Agreement. If you do not agree, do not install or use the Software.
+
+### 2. License Grant
+
+Subject to the one-time payment of the applicable license fee, Licensor grants Licensee a **perpetual, non-exclusive, non-transferable license** to:
+* Install and run the Software on hardware owned or controlled by the Licensee (e.g., a Home Assistant Blue/Yellow, Raspberry Pi, or private server).
+* Use the Software solely for personal or internal household automation purposes.
+* Access the Software's local web interface for configuration and intent management.
+
+### 3. Ownership and "Ownership" Philosophy
+
+The Software is licensed, not sold. Licensor retains all right, title, and interest in and to the Software's proprietary deterministic NLU logic and code. However, Licensor recognizes the Licensee's right to digital autonomy:
+* **No "Phoning Home":** The Software is designed to operate 100% offline.
+* **Perpetual Utility:** Your license is valid for the life of the software version purchased. The Software will not "time out" or cease to function if you choose not to purchase optional maintenance.
+
+### 4. Updates and Support
+
+* **Initial Term:** Your purchase includes free version upgrades and direct technical support for a period of **12 months** from the date of purchase.
+* **Optional Maintenance:** After the initial 12-month term, Licensee may optionally pay an annual maintenance fee (currently **$19.95/year**) to continue receiving updates and support.
+* **Major Upgrades:** While minor updates are included in the maintenance term, Licensor reserves the right to offer major version upgrades as separate purchases, though existing versions will remain functional.
+
+### 5. Restrictions
+
+Licensee may **not**:
+* Redistribute, sublicense, rent, or sell the Software or its binaries to third parties.
+* Reverse engineer, decompile, or disassemble the Software.
+* Use the Software to provide a publicly accessible API or commercial SaaS (Software as a Service) without a separate Enterprise Agreement from Aquila Labs.
+* Modify the Software to bypass the initial license activation process.
+
+### 6. Privacy and Security
+
+Licensor warrants that the Software does not require an internet connection for its core operation. Personal data, voice transcripts (if applicable to your hardware setup), and configuration files (including `secrets.yaml`) are processed locally and are never transmitted to Licensor or any third party.
+
+### 7. Termination
+
+Licensor may terminate this Agreement if Licensee materially breaches its terms. Because the Software is designed for offline use, "termination" primarily refers to the revocation of the right to receive future updates and support. In the event of a breach involving illegal redistribution, Licensee must cease all use and destroy all copies of the Software.
+
+### 8. Limited Warranty & Disclaimer
+
+Licensor warrants that the Software will perform substantially in accordance with the provided documentation. 
+**EXCEPT AS EXPRESSLY PROVIDED, THE SOFTWARE IS PROVIDED "AS IS," WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. LICENSOR DOES NOT WARRANT THAT THE SOFTWARE WILL BE ERROR-FREE OR MEET EVERY SPECIFIC LINGUISTIC REQUIREMENT OF THE USER.**
+
+### 9. Limitation of Liability
+
+To the maximum extent permitted by law, Aquila Labs shall not be liable for any indirect, incidental, or consequential damages arising out of the use or inability to use the Software. In no event shall Licensor's total liability exceed the actual amount paid by the Licensee for the Software.
+
+### 10. Governing Law
+
+This Agreement shall be governed by and construed in accordance with the laws of the **Province of Alberta, Canada**. Any disputes arising from this Agreement shall be settled in the courts of Alberta.
+
+
+
