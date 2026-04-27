@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
-from typing import Literal
+from typing import Any, Literal
 
 from homeassistant.components import conversation
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import intent
+from homeassistant.core import HomeAssistant, State
+from homeassistant.helpers import area_registry as ar, entity_registry as er, intent
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import ulid
@@ -18,6 +19,9 @@ from homeassistant.util import ulid
 from .const import CONF_HOST, CONF_PORT, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
+
+# Sentinel used by _sanitize() to signal a value cannot be JSON-serialized
+_UNSERIALIZABLE = object()
 
 
 async def async_setup_entry(
@@ -118,6 +122,195 @@ class SophiaNLUConversationEntity(
             writer.close()
             await writer.wait_closed()
 
+    async def _async_send_response(
+        self,
+        session_id: str,
+        intents: list[dict[str, Any]],
+    ) -> str:
+        """Send a 'response' request to the NLU server with per-intent results and return the output text."""
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(self._host, self._port), timeout=5.0
+        )
+        try:
+            context: dict[str, Any] = {
+                "session_id": session_id,
+                "intents": intents,
+            }
+
+            request = json.dumps(
+                {"type": "response", "data": {"context": context}},
+                separators=(",", ":"),
+            )
+            payload = f"{request}\n"
+            writer.write(payload.encode("utf-8"))
+            await writer.drain()
+
+            if writer.can_write_eof():
+                writer.write_eof()
+
+            data = await asyncio.wait_for(reader.read(65536), timeout=10.0)
+            _LOGGER.debug(
+                "Sophia NLU response raw (%d bytes): %s", len(data), data[:512]
+            )
+            text_resp = data.decode("utf-8").strip()
+            if not text_resp:
+                _LOGGER.error(
+                    "Sophia NLU returned empty response to 'response' request"
+                )
+                return ""
+            result = json.loads(text_resp)
+            return result.get("data", {}).get("text", "")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    def _build_state_entry(self, state_obj: State) -> dict[str, Any]:
+        """Build an enriched success entry dict from a HA State object."""
+        attrs: dict[str, Any] = {}
+        for k, v in state_obj.attributes.items():
+            try:
+                json.dumps(v)
+                attrs[k] = v
+            except (TypeError, ValueError):
+                pass
+        return {
+            "id": state_obj.entity_id,
+            "name": state_obj.name,
+            "type": "entity",
+            "state": state_obj.state,
+            "attributes": attrs,
+        }
+
+    def _sanitize(self, value: Any) -> Any:
+        """Recursively strip any non-JSON-serializable values from dicts/lists.
+
+        - dicts: drop keys whose values cannot be serialized
+        - lists/tuples: drop elements that cannot be serialized
+        - scalars: return as-is if serializable, otherwise return None as sentinel
+          (caller should discard the key)
+        """
+        if isinstance(value, dict):
+            result: dict[str, Any] = {}
+            for k, v in value.items():
+                sanitized = self._sanitize(v)
+                if sanitized is not _UNSERIALIZABLE:
+                    result[k] = sanitized
+            return result
+        if isinstance(value, (list, tuple)):
+            items = []
+            for v in value:
+                sanitized = self._sanitize(v)
+                if sanitized is not _UNSERIALIZABLE:
+                    items.append(sanitized)
+            return items
+        try:
+            json.dumps(value)
+            return value
+        except (TypeError, ValueError):
+            return _UNSERIALIZABLE
+
+    def _normalize_intent_error(self, err: Exception) -> str:
+        """Return a simplified error string for known noisy error types."""
+        msg = str(err)
+        if "MatchTargetsResult" in msg and "is_match=False" in msg:
+            return "no_match"
+        return msg
+
+    def _build_custom_success(
+        self, intent_name: str, slots: dict[str, Any]
+    ) -> list[dict[str, Any]] | None:
+        """Return a custom success list for intents that need direct state lookup.
+
+        Returns None if this intent does not require custom handling.
+        """
+        # ------------------------------------------------------------------ #
+        # HassGetWeather                                                       #
+        # ------------------------------------------------------------------ #
+        if intent_name == "HassGetWeather":
+            name_slot = slots.get("name", {}).get("value", "").strip()
+            if name_slot:
+                # Look for a weather entity whose friendly name matches
+                for state_obj in self.hass.states.async_all("weather"):
+                    if state_obj.name.lower() == name_slot.lower():
+                        return [self._build_state_entry(state_obj)]
+                _LOGGER.warning(
+                    "HassGetWeather: no weather entity found with name '%s'", name_slot
+                )
+                return []
+            # Fall back to the default forecast entity
+            state_obj = self.hass.states.get("weather.forecast_home")
+            if state_obj is not None:
+                return [self._build_state_entry(state_obj)]
+            _LOGGER.warning("HassGetWeather: weather.forecast_home not found")
+            return []
+
+        # ------------------------------------------------------------------ #
+        # HassClimateGetTemperature                                            #
+        # ------------------------------------------------------------------ #
+        if intent_name == "HassClimateGetTemperature":
+            name_slot = slots.get("name", {}).get("value", "").strip()
+            area_slot = slots.get("area", {}).get("value", "").strip()
+
+            if name_slot:
+                # Single climate entity by friendly name
+                for state_obj in self.hass.states.async_all("climate"):
+                    if state_obj.name.lower() == name_slot.lower():
+                        return [self._build_state_entry(state_obj)]
+                _LOGGER.warning(
+                    "HassClimateGetTemperature: no climate entity found with name '%s'",
+                    name_slot,
+                )
+                return []
+
+            if area_slot:
+                # All climate entities in the named area
+                area_reg = ar.async_get(self.hass)
+                area_entry = area_reg.async_get_area_by_name(area_slot)
+                if area_entry is None:
+                    _LOGGER.warning(
+                        "HassClimateGetTemperature: area '%s' not found", area_slot
+                    )
+                    return []
+                entity_reg = er.async_get(self.hass)
+                entity_entries = er.async_entries_for_area(entity_reg, area_entry.id)
+                results: list[dict[str, Any]] = []
+                for ent in entity_entries:
+                    if ent.domain == "climate":
+                        state_obj = self.hass.states.get(ent.entity_id)
+                        if state_obj is not None:
+                            results.append(self._build_state_entry(state_obj))
+                return results
+
+            # No slots -- return all climate entities
+            return [
+                self._build_state_entry(s)
+                for s in self.hass.states.async_all("climate")
+            ]
+
+        # ------------------------------------------------------------------ #
+        # HassGetState with domain=person                                      #
+        # ------------------------------------------------------------------ #
+        if (
+            intent_name == "HassGetState"
+            and slots.get("domain", {}).get("value") == "person"
+        ):
+            name_slot = slots.get("name", {}).get("value", "").strip()
+            if name_slot:
+                for state_obj in self.hass.states.async_all("person"):
+                    if state_obj.name.lower() == name_slot.lower():
+                        return [self._build_state_entry(state_obj)]
+                _LOGGER.warning(
+                    "HassGetState(person): no person entity found with name '%s'",
+                    name_slot,
+                )
+                return []
+            # No name -- return all person entities
+            return [
+                self._build_state_entry(s) for s in self.hass.states.async_all("person")
+            ]
+
+        return None  # not a custom-handled intent
+
     async def async_process(
         self, user_input: conversation.ConversationInput
     ) -> conversation.ConversationResult:
@@ -159,10 +352,42 @@ class SophiaNLUConversationEntity(
                 response=response, conversation_id=conversation_id
             )
 
+        # Fast path: single HassRespond intent -- use the text from the first TCP
+        # response directly and skip the second TCP request entirely.
+        if len(results) == 1:
+            only = results[0]
+            if only.get("data", {}).get("intent", {}).get("name") == "HassRespond":
+                respond_text = only.get("data", {}).get("text", "").strip()
+                respond_slots = {}
+                for entity in only.get("data", {}).get("entities", []):
+                    slot_name = entity.get("name", "")
+                    slot_value = entity.get("value", "")
+                    if slot_name:
+                        respond_slots[slot_name] = {"value": slot_value}
+                try:
+                    respond_result = await intent.async_handle(
+                        self.hass,
+                        DOMAIN,
+                        "HassRespond",
+                        respond_slots,
+                        text,
+                        user_input.context,
+                        language=language,
+                        assistant=conversation.DOMAIN,
+                    )
+                except Exception as err:
+                    _LOGGER.error("HassRespond intent error: %s", err)
+                    respond_result = intent.IntentResponse(language=language)
+                respond_result.async_set_speech(respond_text or "Done.")
+                return conversation.ConversationResult(
+                    response=respond_result, conversation_id=conversation_id
+                )
+
         # Process each intent returned by the NLU engine.
         # The server may return multiple JSONL lines, one per detected intent.
-        speech_parts: list[str] = []
         last_intent_result: intent.IntentResponse | None = None
+        session_id: str | None = None
+        intents_context: list[dict[str, Any]] = []
 
         for result in results:
             # Wyoming error response
@@ -175,10 +400,9 @@ class SophiaNLUConversationEntity(
                     error_text,
                     error_data.get("code"),
                 )
-                speech_parts.append(f"NLU error: {error_text}")
                 continue
 
-            # Wyoming intent response: {"type": "intent", "data": {"intent": {"name": "...", "confidence": ...}, "entities": [{"name": "...", "value": "..."}], "text": "..."}}
+            # Wyoming intent response
             data = result.get("data", {})
             intent_info = data.get("intent", {})
             intent_name = intent_info.get("name", "")
@@ -189,6 +413,10 @@ class SophiaNLUConversationEntity(
                 )
                 continue
 
+            # Grab session_id from the first valid result
+            if session_id is None:
+                session_id = data.get("metadata", {}).get("session_id")
+
             # Map Wyoming entities to HA intent slots: [{"name": "x", "value": "y"}] -> {"x": {"value": "y"}}
             slots = {}
             for entity in data.get("entities", []):
@@ -197,6 +425,12 @@ class SophiaNLUConversationEntity(
                 if slot_name:
                     slots[slot_name] = {"value": slot_value}
 
+            # Check whether this intent needs custom success population
+            custom_success = self._build_custom_success(intent_name, slots)
+            is_custom = custom_success is not None
+
+            intent_result: intent.IntentResponse | None = None
+            intent_err_msg: str | None = None
             try:
                 intent_result = await intent.async_handle(
                     self.hass,
@@ -207,43 +441,105 @@ class SophiaNLUConversationEntity(
                     user_input.context,
                     language=language,
                     assistant=conversation.DOMAIN,
+                    device_id=user_input.device_id,
                 )
             except intent.IntentHandleError as err:
                 _LOGGER.error("Intent handling error for %s: %s", intent_name, err)
-                speech_parts.append(f"Error handling intent: {err}")
-                continue
+                intent_err_msg = self._normalize_intent_error(err)
             except intent.IntentUnexpectedError as err:
                 _LOGGER.error("Unexpected intent error for %s: %s", intent_name, err)
-                speech_parts.append(f"Unexpected error: {err}")
-                continue
+                intent_err_msg = self._normalize_intent_error(err)
             except Exception as err:
                 _LOGGER.exception("Failed to handle intent %s", intent_name)
-                speech_parts.append(f"Failed to handle intent: {err}")
+                intent_err_msg = self._normalize_intent_error(err)
+
+            # If HA errored and this isn't a custom-handled intent, emit an error entry
+            if intent_result is None and not is_custom:
+                intent_entry: dict[str, Any] = {
+                    "response_type": "error",
+                    "success": [],
+                    "failed": [],
+                    "error": intent_err_msg or "unknown error",
+                }
+                intents_context.append(intent_entry)
                 continue
 
-            last_intent_result = intent_result
-            # Collect speech from each successful intent result
-            speech = (
-                intent_result.speech.get("plain", {}).get("speech", "")
-                if intent_result.speech
-                else ""
-            )
-            if speech:
-                speech_parts.append(speech)
+            # Determine success list: custom intents always override HA results
+            if is_custom:
+                success_list: list[dict[str, Any]] = custom_success  # type: ignore[assignment]
+            else:
+                # Build success list, enriching entity targets with live HA state and attributes
+                success_list = []
+                for t in intent_result.success_results:  # type: ignore[union-attr]
+                    entry = dataclasses.asdict(t)
+                    if t.id and t.type == "entity":
+                        state_obj = self.hass.states.get(t.id)
+                        if state_obj is not None:
+                            entry["state"] = state_obj.state
+                            attrs: dict[str, Any] = {}
+                            for k, v in state_obj.attributes.items():
+                                try:
+                                    json.dumps(v)
+                                    attrs[k] = v
+                                except (TypeError, ValueError):
+                                    pass
+                            entry["attributes"] = attrs
+                    success_list.append(entry)
 
-        # If at least one intent was handled successfully, build a combined response.
+            # Build the per-intent context entry
+            if intent_result is not None:
+                response_type_val = intent_result.response_type.value
+                failed_list = [
+                    dataclasses.asdict(t) for t in intent_result.failed_results
+                ]
+                speech_slots_val = intent_result.speech_slots or None
+            else:
+                # Custom intent but HA errored -- treat as action_done, no failed targets
+                response_type_val = "action_done"
+                failed_list = []
+                speech_slots_val = None
+
+            intent_entry = {
+                "response_type": response_type_val,
+                "success": success_list,
+                "failed": failed_list,
+            }
+            if speech_slots_val:
+                intent_entry["speech_slots"] = self._sanitize(speech_slots_val)
+            if intent_err_msg and not is_custom:
+                intent_entry["error"] = intent_err_msg
+
+            intents_context.append(intent_entry)
+            if intent_result is not None:
+                last_intent_result = intent_result
+
+        # Send per-intent results back to the NLU engine to generate output text
+        if session_id:
+            try:
+                final_speech = await self._async_send_response(
+                    session_id,
+                    intents_context,
+                )
+            except (OSError, asyncio.TimeoutError) as err:
+                _LOGGER.error("Failed to get response text from Sophia NLU: %s", err)
+                final_speech = ""
+            except Exception as err:
+                _LOGGER.exception("Error getting response text from Sophia NLU")
+                final_speech = ""
+        else:
+            _LOGGER.warning(
+                "No session_id in NLU response; cannot generate output text"
+            )
+            final_speech = ""
+
+        # Finish up: set the output text and return the conversation result to HA
         if last_intent_result is not None:
-            if speech_parts:
-                last_intent_result.async_set_speech(" ".join(speech_parts))
+            last_intent_result.async_set_speech(final_speech or "Done.")
             return conversation.ConversationResult(
                 response=last_intent_result, conversation_id=conversation_id
             )
 
-        # All results were errors or had no intent name
-        if speech_parts:
-            response.async_set_speech(" ".join(speech_parts))
-        else:
-            response.async_set_speech("Sorry, I didn't understand that.")
+        response.async_set_speech(final_speech or "Sorry, I didn't understand that.")
         return conversation.ConversationResult(
             response=response, conversation_id=conversation_id
         )
