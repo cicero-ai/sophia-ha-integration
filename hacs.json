@@ -1,11 +1,5 @@
-
 {
   "name": "Sophia NLU Engine",
   "content_in_root": false,
-  "homeassistant": "2025.1.0",          // Minimum HA version your integration supports
-  "render_readme": true,
-  "category": "integration",
-  "tags": ["nlu", "voice", "ai", "conversation"],
-  "iot_class": "local_polling"
+  "homeassistant": "2025.1.0"
 }
-

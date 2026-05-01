@@ -3,7 +3,7 @@
   "name": "Sophia NLU Engine",
   "version": "1.0.4",
   "documentation": "https://nlu.to/ha/docs/",
-  "issue_tracker": "https://git.nlu.to/aquila/sophia-ha-integration/issues",
+  "issue_tracker": "https://github.com/cicero-ai/sophia-ha-integration/issues",
   "requirements": [],
   "dependencies": ["conversation"],
   "after_dependencies": ["assist_pipeline", "intent"],
