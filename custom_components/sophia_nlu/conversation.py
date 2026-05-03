@@ -425,6 +425,53 @@ class SophiaNLUConversationEntity(
                 if slot_name:
                     slots[slot_name] = {"value": slot_value}
 
+            # If an "automation" slot is present, trigger that automation directly
+            # and skip the normal HA intent pipeline entirely.
+            automation_id = slots.get("automation", {}).get("value", "").strip()
+            if automation_id:
+                automation_err_msg: str | None = None
+                try:
+                    await self.hass.services.async_call(
+                        "automation",
+                        "trigger",
+                        {"entity_id": automation_id},
+                        blocking=True,
+                        context=user_input.context,
+                    )
+                    _LOGGER.debug("Triggered automation '%s'", automation_id)
+                except Exception as err:
+                    _LOGGER.error(
+                        "Failed to trigger automation '%s': %s", automation_id, err
+                    )
+                    automation_err_msg = str(err)
+
+                if automation_err_msg:
+                    intents_context.append(
+                        {
+                            "response_type": "error",
+                            "success": [],
+                            "failed": [],
+                            "error": automation_err_msg,
+                        }
+                    )
+                else:
+                    intents_context.append(
+                        {
+                            "response_type": "action_done",
+                            "success": [
+                                {
+                                    "id": automation_id,
+                                    "name": automation_id,
+                                    "type": "automation",
+                                    "state": "triggered",
+                                    "attributes": {},
+                                }
+                            ],
+                            "failed": [],
+                        }
+                    )
+                continue
+
             # Check whether this intent needs custom success population
             custom_success = self._build_custom_success(intent_name, slots)
             is_custom = custom_success is not None
