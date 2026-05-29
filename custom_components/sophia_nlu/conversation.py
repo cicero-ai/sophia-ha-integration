@@ -216,76 +216,49 @@ class SophiaNLUConversationEntity(
             return "no_match"
         return msg
 
-    def _build_custom_success(
+    async def _build_custom_success(
         self, intent_name: str, slots: dict[str, Any]
     ) -> list[dict[str, Any]] | None:
-        """Return a custom success list for intents that need direct state lookup.
+        """Return a custom success list for intents that need direct state lookup or custom execution.
 
         Returns None if this intent does not require custom handling.
         """
         # ------------------------------------------------------------------ #
-        # HassGetWeather                                                       #
+        # HassTurnOn with domain=automation                                  #
         # ------------------------------------------------------------------ #
-        if intent_name == "HassGetWeather":
+        if (
+            intent_name == "HassTurnOn"
+            and slots.get("domain", {}).get("value") == "automation"
+        ):
             name_slot = slots.get("name", {}).get("value", "").strip()
             if name_slot:
-                # Look for a weather entity whose friendly name matches
-                for state_obj in self.hass.states.async_all("weather"):
+                # Find the automation entity whose friendly name matches the slot value
+                for state_obj in self.hass.states.async_all("automation"):
                     if state_obj.name.lower() == name_slot.lower():
-                        return [self._build_state_entry(state_obj)]
+                        automation_id = state_obj.entity_id
+                        try:
+                            # Explicitly call the trigger service to execute actions immediately
+                            await self.hass.services.async_call(
+                                "automation",
+                                "trigger",
+                                {"entity_id": automation_id},
+                                blocking=True,
+                            )
+                            _LOGGER.debug("Triggered automation '%s' via custom handler", automation_id)
+                            return [self._build_state_entry(state_obj)]
+                        except Exception as err:
+                            _LOGGER.error(
+                                "Failed to trigger automation '%s': %s", automation_id, err
+                            )
+                            return []
+
                 _LOGGER.warning(
-                    "HassGetWeather: no weather entity found with name '%s'", name_slot
+                    "HassTurnOn(automation): no automation found with name '%s'", name_slot
                 )
                 return []
-            # Fall back to the default forecast entity
-            state_obj = self.hass.states.get("weather.forecast_home")
-            if state_obj is not None:
-                return [self._build_state_entry(state_obj)]
-            _LOGGER.warning("HassGetWeather: weather.forecast_home not found")
+            
+            _LOGGER.warning("HassTurnOn(automation): missing 'name' slot to identify automation")
             return []
-
-        # ------------------------------------------------------------------ #
-        # HassClimateGetTemperature                                            #
-        # ------------------------------------------------------------------ #
-        if intent_name == "HassClimateGetTemperature":
-            name_slot = slots.get("name", {}).get("value", "").strip()
-            area_slot = slots.get("area", {}).get("value", "").strip()
-
-            if name_slot:
-                # Single climate entity by friendly name
-                for state_obj in self.hass.states.async_all("climate"):
-                    if state_obj.name.lower() == name_slot.lower():
-                        return [self._build_state_entry(state_obj)]
-                _LOGGER.warning(
-                    "HassClimateGetTemperature: no climate entity found with name '%s'",
-                    name_slot,
-                )
-                return []
-
-            if area_slot:
-                # All climate entities in the named area
-                area_reg = ar.async_get(self.hass)
-                area_entry = area_reg.async_get_area_by_name(area_slot)
-                if area_entry is None:
-                    _LOGGER.warning(
-                        "HassClimateGetTemperature: area '%s' not found", area_slot
-                    )
-                    return []
-                entity_reg = er.async_get(self.hass)
-                entity_entries = er.async_entries_for_area(entity_reg, area_entry.id)
-                results: list[dict[str, Any]] = []
-                for ent in entity_entries:
-                    if ent.domain == "climate":
-                        state_obj = self.hass.states.get(ent.entity_id)
-                        if state_obj is not None:
-                            results.append(self._build_state_entry(state_obj))
-                return results
-
-            # No slots -- return all climate entities
-            return [
-                self._build_state_entry(s)
-                for s in self.hass.states.async_all("climate")
-            ]
 
         # ------------------------------------------------------------------ #
         # HassGetState with domain=person                                      #
@@ -425,55 +398,9 @@ class SophiaNLUConversationEntity(
                 if slot_name:
                     slots[slot_name] = {"value": slot_value}
 
-            # If an "automation" slot is present, trigger that automation directly
-            # and skip the normal HA intent pipeline entirely.
-            automation_id = slots.get("automation", {}).get("value", "").strip()
-            if automation_id:
-                automation_err_msg: str | None = None
-                try:
-                    await self.hass.services.async_call(
-                        "automation",
-                        "trigger",
-                        {"entity_id": automation_id},
-                        blocking=True,
-                        context=user_input.context,
-                    )
-                    _LOGGER.debug("Triggered automation '%s'", automation_id)
-                except Exception as err:
-                    _LOGGER.error(
-                        "Failed to trigger automation '%s': %s", automation_id, err
-                    )
-                    automation_err_msg = str(err)
-
-                if automation_err_msg:
-                    intents_context.append(
-                        {
-                            "response_type": "error",
-                            "success": [],
-                            "failed": [],
-                            "error": automation_err_msg,
-                        }
-                    )
-                else:
-                    intents_context.append(
-                        {
-                            "response_type": "action_done",
-                            "success": [
-                                {
-                                    "id": automation_id,
-                                    "name": automation_id,
-                                    "type": "automation",
-                                    "state": "triggered",
-                                    "attributes": {},
-                                }
-                            ],
-                            "failed": [],
-                        }
-                    )
-                continue
 
             # Check whether this intent needs custom success population
-            custom_success = self._build_custom_success(intent_name, slots)
+            custom_success = await self._build_custom_success(intent_name, slots)
             is_custom = custom_success is not None
 
             intent_result: intent.IntentResponse | None = None
