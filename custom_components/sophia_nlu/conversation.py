@@ -224,6 +224,70 @@ class SophiaNLUConversationEntity(
         Returns None if this intent does not require custom handling.
         """
         # ------------------------------------------------------------------ #
+        # HassGetWeather                                                       #
+        # ------------------------------------------------------------------ #
+        if intent_name == "HassGetWeather":
+            name_slot = slots.get("name", {}).get("value", "").strip()
+            if name_slot:
+                # Look for a weather entity whose friendly name matches
+                for state_obj in self.hass.states.async_all("weather"):
+                    if state_obj.name.lower() == name_slot.lower():
+                        return [self._build_state_entry(state_obj)]
+                _LOGGER.warning(
+                    "HassGetWeather: no weather entity found with name '%s'", name_slot
+                )
+                return []
+            # Fall back to the default forecast entity
+            state_obj = self.hass.states.get("weather.forecast_home")
+            if state_obj is not None:
+                return [self._build_state_entry(state_obj)]
+            _LOGGER.warning("HassGetWeather: weather.forecast_home not found")
+            return []
+
+        # ------------------------------------------------------------------ #
+        # HassClimateGetTemperature                                            #
+        # ------------------------------------------------------------------ #
+        if intent_name == "HassClimateGetTemperature":
+            name_slot = slots.get("name", {}).get("value", "").strip()
+            area_slot = slots.get("area", {}).get("value", "").strip()
+
+            if name_slot:
+                # Single climate entity by friendly name
+                for state_obj in self.hass.states.async_all("climate"):
+                    if state_obj.name.lower() == name_slot.lower():
+                        return [self._build_state_entry(state_obj)]
+                _LOGGER.warning(
+                    "HassClimateGetTemperature: no climate entity found with name '%s'",
+                    name_slot,
+                )
+                return []
+
+            if area_slot:
+                # All climate entities in the named area
+                area_reg = ar.async_get(self.hass)
+                area_entry = area_reg.async_get_area_by_name(area_slot)
+                if area_entry is None:
+                    _LOGGER.warning(
+                        "HassClimateGetTemperature: area '%s' not found", area_slot
+                    )
+                    return []
+                entity_reg = er.async_get(self.hass)
+                entity_entries = er.async_entries_for_area(entity_reg, area_entry.id)
+                results: list[dict[str, Any]] = []
+                for ent in entity_entries:
+                    if ent.domain == "climate":
+                        state_obj = self.hass.states.get(ent.entity_id)
+                        if state_obj is not None:
+                            results.append(self._build_state_entry(state_obj))
+                return results
+
+            # No slots -- return all climate entities
+            return [
+                self._build_state_entry(s)
+                for s in self.hass.states.async_all("climate")
+            ]
+
+        # ------------------------------------------------------------------ #
         # HassTurnOn with domain=automation                                  #
         # ------------------------------------------------------------------ #
         if (
@@ -346,7 +410,7 @@ class SophiaNLUConversationEntity(
                         text,
                         user_input.context,
                         language=language,
-                        assistant=conversation.DOMAIN,
+                        #assistant=conversation.DOMAIN,
                     )
                 except Exception as err:
                     _LOGGER.error("HassRespond intent error: %s", err)
@@ -414,7 +478,7 @@ class SophiaNLUConversationEntity(
                     text,
                     user_input.context,
                     language=language,
-                    assistant=conversation.DOMAIN,
+                    #assistant=conversation.DOMAIN,
                     device_id=user_input.device_id,
                 )
             except intent.IntentHandleError as err:
