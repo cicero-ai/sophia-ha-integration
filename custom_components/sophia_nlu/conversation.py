@@ -410,7 +410,7 @@ class SophiaNLUConversationEntity(
                         text,
                         user_input.context,
                         language=language,
-                        #assistant=conversation.DOMAIN,
+                        assistant=conversation.DOMAIN,
                     )
                 except Exception as err:
                     _LOGGER.error("HassRespond intent error: %s", err)
@@ -478,7 +478,7 @@ class SophiaNLUConversationEntity(
                     text,
                     user_input.context,
                     language=language,
-                    #assistant=conversation.DOMAIN,
+                    assistant=conversation.DOMAIN,
                     device_id=user_input.device_id,
                 )
             except intent.IntentHandleError as err:
