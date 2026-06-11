@@ -389,11 +389,12 @@ class SophiaNLUConversationEntity(
                 response=response, conversation_id=conversation_id
             )
 
-        # Fast path: single HassRespond intent -- use the text from the first TCP
-        # response directly and skip the second TCP request entirely.
+        # HassRespond / HassClarification - immediately provide speech response
         if len(results) == 1:
             only = results[0]
-            if only.get("data", {}).get("intent", {}).get("name") == "HassRespond":
+            intent_name = only.get("data", {}).get("intent", {}).get("name")
+            
+            if intent_name in ("HassRespond", "HassClarification"):
                 respond_text = only.get("data", {}).get("text", "").strip()
                 respond_slots = {}
                 for entity in only.get("data", {}).get("entities", []):
@@ -413,12 +414,16 @@ class SophiaNLUConversationEntity(
                         assistant=conversation.DOMAIN,
                     )
                 except Exception as err:
-                    _LOGGER.error("HassRespond intent error: %s", err)
+                    _LOGGER.error("%s intent error: %s", intent_name, err)
                     respond_result = intent.IntentResponse(language=language)
+                
                 respond_result.async_set_speech(respond_text or "Done.")
                 return conversation.ConversationResult(
-                    response=respond_result, conversation_id=conversation_id
+                    response=respond_result, 
+                    conversation_id=conversation_id,
+                    continue_conversation=(intent_name == "HassClarification") 
                 )
+
 
         # Process each intent returned by the NLU engine.
         # The server may return multiple JSONL lines, one per detected intent.
