@@ -325,6 +325,43 @@ class SophiaNLUConversationEntity(
             return []
 
         # ------------------------------------------------------------------ #
+        # HassTurnOn with domain=script                                      #
+        # ------------------------------------------------------------------ #
+        if (
+            intent_name == "HassTurnOn"
+            and slots.get("domain", {}).get("value") == "script"
+        ):
+            name_slot = slots.get("name", {}).get("value", "").strip()
+            if name_slot:
+                for state_obj in self.hass.states.async_all("script"):
+                    if state_obj.name.lower() == name_slot.lower():
+                        script_id = state_obj.entity_id
+                        try:
+                            # Scripts are executed by calling the service matching their object_id
+                            # (e.g., domain "script", service "good_morning_routine")
+                            await self.hass.services.async_call(
+                                "script",
+                                state_obj.object_id,
+                                {},
+                                blocking=True,
+                            )
+                            _LOGGER.debug("Triggered script '%s' via custom handler", script_id)
+                            return [self._build_state_entry(state_obj)]
+                        except Exception as err:
+                            _LOGGER.error(
+                                "Failed to trigger script '%s': %s", script_id, err
+                            )
+                            return []
+
+                _LOGGER.warning(
+                    "HassTurnOn(script): no script found with name '%s'", name_slot
+                )
+                return []
+            
+            _LOGGER.warning("HassTurnOn(script): missing 'name' slot to identify script")
+            return []
+
+        # ------------------------------------------------------------------ #
         # HassGetState with domain=person                                      #
         # ------------------------------------------------------------------ #
         if (

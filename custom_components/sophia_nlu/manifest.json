@@ -1,7 +1,7 @@
 {
   "domain": "sophia_nlu",
   "name": "Sophia NLU Engine",
-  "version": "1.2.0",
+  "version": "1.2.3",
   "documentation": "https://nlu.to/ha/docs/",
   "issue_tracker": "https://github.com/cicero-ai/sophia-ha-integration/issues",
   "requirements": [],
