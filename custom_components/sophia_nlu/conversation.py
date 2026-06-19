@@ -569,6 +569,8 @@ class SophiaNLUConversationEntity(
 
                 if "common_name" in slots:
                     common_name = slots["common_name"].get("value")
+                else:
+                    common_name = None
 
             # Get entity IDs
             devices = self._resolve_entities_from_slots(slots)
