@@ -6,12 +6,19 @@ import asyncio
 import dataclasses
 import json
 import logging
+import time
 from typing import Any, Literal
 
 from homeassistant.components import conversation
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, State
-from homeassistant.helpers import area_registry as ar, entity_registry as er, device_registry as dr, floor_registry as fr, intent
+from homeassistant.helpers import (
+    area_registry as ar,
+    entity_registry as er,
+    device_registry as dr,
+    floor_registry as fr,
+    intent,
+)
 
 
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -55,6 +62,7 @@ class SophiaNLUConversationEntity(
             name="Sophia NLU Engine",
             manufacturer="Aquila Labs",
         )
+        self._conversation_sessions: dict[str, dict] = {}
 
     @property
     def supported_languages(self) -> list[str] | Literal["*"]:
@@ -72,7 +80,7 @@ class SophiaNLUConversationEntity(
         await super().async_will_remove_from_hass()
 
     async def _async_send_to_nlu(
-        self, text: str, conversation_id: str, language: str
+        self, text: str, conversation_id: str, language: str, is_reply: bool = False
     ) -> list[dict]:
         """Send a Wyoming 'recognize' request to the Sophia NLU server and return parsed JSON responses.
 
@@ -91,6 +99,7 @@ class SophiaNLUConversationEntity(
                         "text": text,
                         "language": language,
                         "session_id": conversation_id,
+                        "context": {"is_reply": 1 if is_reply else 0},
                     },
                 },
                 separators=(",", ":"),
@@ -218,16 +227,39 @@ class SophiaNLUConversationEntity(
             return "no_match"
         return msg
 
+    def _is_reply(self, conversation_id: str) -> bool:
+        """Return True if this turn should be flagged as a reply.
+
+        True if the previous turn had continue_conversation=True, or if the
+        previous turn for this conversation_id was received within the last 30 seconds.
+        """
+        session = self._conversation_sessions.get(conversation_id)
+        if session is None:
+            return False
+        if session.get("continue_conversation"):
+            return True
+        last_ts = session.get("last_ts")
+        if last_ts is not None and (time.monotonic() - last_ts) <= 30.0:
+            return True
+        return False
+
+    def _update_session(
+        self, conversation_id: str, continue_conversation: bool
+    ) -> None:
+        """Store/update per-session state after a turn completes."""
+        self._conversation_sessions[conversation_id] = {
+            "last_ts": time.monotonic(),
+            "continue_conversation": continue_conversation,
+        }
 
     async def check_instant_response(
-        self, 
-        results: list[dict], 
-        text: str, 
-        conversation_id: str, 
-        language: str, 
-        user_input: conversation.ConversationInput
+        self,
+        results: list[dict],
+        text: str,
+        conversation_id: str,
+        language: str,
+        user_input: conversation.ConversationInput,
     ) -> conversation.ConversationResult | None:
-
         if len(results) != 1:
             return None
 
@@ -262,9 +294,9 @@ class SophiaNLUConversationEntity(
 
         respond_result.async_set_speech(respond_text or "Done.")
         return conversation.ConversationResult(
-            response=respond_result, 
+            response=respond_result,
             conversation_id=conversation_id,
-            continue_conversation=(intent_name == "HassClarification") 
+            continue_conversation=(intent_name == "HassClarification"),
         )
 
     def _resolve_entities_from_slots(self, slots: dict[str, Any]) -> list[str]:
@@ -284,7 +316,11 @@ class SophiaNLUConversationEntity(
                 for state_obj in self.hass.states.async_all(domain):
                     if state_obj.name.lower() == name_slot.lower():
                         return [state_obj.entity_id]
-                _LOGGER.warning("No entity found in domain '%s' matching name '%s'", domain, name_slot)
+                _LOGGER.warning(
+                    "No entity found in domain '%s' matching name '%s'",
+                    domain,
+                    name_slot,
+                )
                 return []
 
         # 3. Resolve by Floor or Area friendly names
@@ -300,28 +336,32 @@ class SophiaNLUConversationEntity(
                     if area_entry:
                         area_ids.add(area_entry.id)
                     else:
-                        _LOGGER.warning("Could not find registered area named '%s'", area_name)
-            
+                        _LOGGER.warning(
+                            "Could not find registered area named '%s'", area_name
+                        )
+
             # Match floor by friendly name, then gather all child area IDs
             elif "floor" in slots:
                 floor_name = slots["floor"].get("value", "").strip()
                 if floor_name:
                     floor_reg = fr.async_get(self.hass)
                     target_floor_id = None
-                    
+
                     # Find the floor ID matching the friendly name
                     for floor_entry in floor_reg.floors.values():
                         if floor_entry.name.lower() == floor_name.lower():
                             target_floor_id = floor_entry.floor_id
                             break
-                    
+
                     if target_floor_id:
                         # Grab all area IDs that belong to this floor ID
                         for area_entry in area_reg.areas.values():
                             if area_entry.floor_id == target_floor_id:
                                 area_ids.add(area_entry.id)
                     else:
-                        _LOGGER.warning("Could not find registered floor named '%s'", floor_name)
+                        _LOGGER.warning(
+                            "Could not find registered floor named '%s'", floor_name
+                        )
 
             if not area_ids:
                 return []
@@ -351,15 +391,24 @@ class SophiaNLUConversationEntity(
 
         # 4. Fallback: Grab all entities in the domain if no targeting criteria matched
         if domain:
-            return [state_obj.entity_id for state_obj in self.hass.states.async_all(domain)]
+            return [
+                state_obj.entity_id for state_obj in self.hass.states.async_all(domain)
+            ]
 
         return []
 
     def _extract_service_payload(self, slots: dict[str, Any]) -> dict[str, Any]:
         """Filter out scoping fields and flatten slot values for core API delivery."""
         excluded_slots = {
-            "id", "entity_id", "area", "floor", "name", 
-            "domain", "device_class", "state", "common_name"
+            "id",
+            "entity_id",
+            "area",
+            "floor",
+            "name",
+            "domain",
+            "device_class",
+            "state",
+            "common_name",
         }
         payload = {}
         for key, slot_dict in slots.items():
@@ -369,7 +418,12 @@ class SophiaNLUConversationEntity(
                     payload[key] = val
         return payload
 
-    async def async_handle_standard_intent(self, intent_name: str, slots: dict[str, Any], user_input: conversation.ConversationInput) -> dict[str, Any]:
+    async def async_handle_standard_intent(
+        self,
+        intent_name: str,
+        slots: dict[str, Any],
+        user_input: conversation.ConversationInput,
+    ) -> dict[str, Any]:
         text = user_input.text
         language = user_input.language or "en"
 
@@ -428,9 +482,7 @@ class SophiaNLUConversationEntity(
         # Build the per-intent context entry
         if intent_result is not None:
             response_type_val = intent_result.response_type.value
-            failed_list = [
-                dataclasses.asdict(t) for t in intent_result.failed_results
-            ]
+            failed_list = [dataclasses.asdict(t) for t in intent_result.failed_results]
             speech_slots_val = intent_result.speech_slots or None
         else:
             response_type_val = "action_done"
@@ -449,9 +501,12 @@ class SophiaNLUConversationEntity(
 
         return intent_entry
 
-    async def async_get_entity(self, entity_id: str, common_name: str | None) -> tuple[bool, dict[str, Any]]:
+    async def async_get_entity(
+        self, entity_id: str, common_name: str | None
+    ) -> tuple[bool, dict[str, Any]]:
         tmp_entity_name = " ".join(
-            w for w in (
+            w
+            for w in (
                 word.rstrip("0123456789")
                 for word in entity_id.split(".", 1)[-1].replace("_", " ").split()
             )
@@ -469,7 +524,7 @@ class SophiaNLUConversationEntity(
                 "name": tmp_entity_name,
                 "type": "entity",
                 "state": "unknown",
-                "reason": "entity_not_found"
+                "reason": "entity_not_found",
             }
 
         # 2. Sanitize and pack attributes safely for JSON encoding
@@ -481,7 +536,11 @@ class SophiaNLUConversationEntity(
             except (TypeError, ValueError):
                 pass
 
-        entity_name = (state_obj.attributes.get("friendly_name") or state_obj.name or tmp_entity_name)
+        entity_name = (
+            state_obj.attributes.get("friendly_name")
+            or state_obj.name
+            or tmp_entity_name
+        )
 
         entity_payload = {
             "id": state_obj.entity_id,
@@ -499,8 +558,9 @@ class SophiaNLUConversationEntity(
 
         return True, entity_payload
 
-
-    async def async_process(self, user_input: conversation.ConversationInput) -> conversation.ConversationResult:
+    async def async_process(
+        self, user_input: conversation.ConversationInput
+    ) -> conversation.ConversationResult:
         """Process a sentence."""
         text = user_input.text.strip()
         conversation_id = user_input.conversation_id or ulid.ulid()
@@ -509,26 +569,47 @@ class SophiaNLUConversationEntity(
 
         if not text:
             response.async_set_speech("No text provided.")
-            return conversation.ConversationResult(response=response, conversation_id=conversation_id)
+            return conversation.ConversationResult(
+                response=response, conversation_id=conversation_id
+            )
 
+        is_reply = self._is_reply(conversation_id)
         try:
-            results = await self._async_send_to_nlu(text, conversation_id, language)
+            results = await self._async_send_to_nlu(
+                text, conversation_id, language, is_reply
+            )
         except (OSError, asyncio.TimeoutError) as err:
-            _LOGGER.error("Failed to connect to Sophia NLU at %s:%s: %s", self._host, self._port, err,)
+            _LOGGER.error(
+                "Failed to connect to Sophia NLU at %s:%s: %s",
+                self._host,
+                self._port,
+                err,
+            )
             response.async_set_speech("Sorry, I could not connect to the NLU engine.")
-            return conversation.ConversationResult(response=response, conversation_id=conversation_id)
+            return conversation.ConversationResult(
+                response=response, conversation_id=conversation_id
+            )
         except Exception as err:
             _LOGGER.exception("Error communicating with Sophia NLU")
             response.async_set_speech(f"Error communicating with NLU engine: {err}")
-            return conversation.ConversationResult(response=response, conversation_id=conversation_id)
+            return conversation.ConversationResult(
+                response=response, conversation_id=conversation_id
+            )
 
         if not results:
             response.async_set_speech("Sorry, I didn't understand that.")
-            return conversation.ConversationResult(response=response, conversation_id=conversation_id)
+            return conversation.ConversationResult(
+                response=response, conversation_id=conversation_id
+            )
 
         # Immediately provide response if HassRespond or HassClarification
-        instant_response = await self.check_instant_response(results, text, conversation_id, language, user_input)
+        instant_response = await self.check_instant_response(
+            results, text, conversation_id, language, user_input
+        )
         if instant_response is not None:
+            self._update_session(
+                conversation_id, instant_response.continue_conversation
+            )
             return instant_response
 
         # Process each intent returned by the NLU engine.
@@ -543,7 +624,11 @@ class SophiaNLUConversationEntity(
             if resp_type == "error":
                 error_data = result.get("data", {})
                 error_text = error_data.get("text", "Unknown error from NLU engine")
-                _LOGGER.error("Sophia NLU returned error: %s (code=%s)", error_text, error_data.get("code"),)
+                _LOGGER.error(
+                    "Sophia NLU returned error: %s (code=%s)",
+                    error_text,
+                    error_data.get("code"),
+                )
                 continue
 
             # Wyoming intent response
@@ -552,7 +637,9 @@ class SophiaNLUConversationEntity(
             intent_name = intent_info.get("name", "")
 
             if not intent_name:
-                _LOGGER.warning("Sophia NLU returned a result with no intent name, skipping")
+                _LOGGER.warning(
+                    "Sophia NLU returned a result with no intent name, skipping"
+                )
                 continue
 
             # Grab session_id from the first valid result
@@ -578,13 +665,22 @@ class SophiaNLUConversationEntity(
                 common_name = None
 
             # Standard HA intent system
-            if len(devices) == 0 or "Timer" in intent_name or "List" in intent_name or intent_name in ["HassBroadcast", "HassNevermind"]:
-                intent_entry = await self.async_handle_standard_intent(intent_name, slots, user_input)
+            if (
+                len(devices) == 0
+                or "Timer" in intent_name
+                or "List" in intent_name
+                or intent_name in ["HassBroadcast", "HassNevermind"]
+            ):
+                intent_entry = await self.async_handle_standard_intent(
+                    intent_name, slots, user_input
+                )
                 intents_context.append(intent_entry)
 
                 if last_intent_result is None:
                     last_intent_result = intent.IntentResponse(language=language)
-                    last_intent_result.response_type = intent.IntentResponseType.ACTION_DONE
+                    last_intent_result.response_type = (
+                        intent.IntentResponseType.ACTION_DONE
+                    )
                 continue
 
             intent_entry: dict[str, Any] = {
@@ -598,7 +694,6 @@ class SophiaNLUConversationEntity(
 
             # GO through devices
             for entity_id in devices:
-
                 if service_target is not None:
                     service_domain, service_name = service_target
                     service_data = self._extract_service_payload(slots)
@@ -611,10 +706,19 @@ class SophiaNLUConversationEntity(
                             service_data,
                             blocking=True,
                         )
-                        _LOGGER.debug("Bypassed intent pipeline. Fired service %s.%s with %s", service_domain, service_name, service_data)
+                        _LOGGER.debug(
+                            "Bypassed intent pipeline. Fired service %s.%s with %s",
+                            service_domain,
+                            service_name,
+                            service_data,
+                        )
                         intent_entry["response_type"] = "action_done"
                     except Exception as err:
-                        _LOGGER.error("Direct execution fallback failed for %s: %s", entity_id, err)
+                        _LOGGER.error(
+                            "Direct execution fallback failed for %s: %s",
+                            entity_id,
+                            err,
+                        )
                         intent_entry["response_type"] = "error"
                         continue
 
@@ -629,7 +733,6 @@ class SophiaNLUConversationEntity(
             if last_intent_result is None:
                 last_intent_result = intent.IntentResponse(language=language)
                 last_intent_result.response_type = intent.IntentResponseType.ACTION_DONE
-
 
         # Send per-intent results back to the NLU engine to generate output text
         if session_id:
@@ -653,11 +756,13 @@ class SophiaNLUConversationEntity(
         # Finish up: set the output text and return the conversation result to HA
         if last_intent_result is not None:
             last_intent_result.async_set_speech(final_speech or "Done.")
+            self._update_session(conversation_id, False)
             return conversation.ConversationResult(
                 response=last_intent_result, conversation_id=conversation_id
             )
 
         response.async_set_speech(final_speech or "Sorry, I didn't understand that.")
+        self._update_session(conversation_id, False)
         return conversation.ConversationResult(
             response=response, conversation_id=conversation_id
         )
