@@ -38,13 +38,22 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up conversation entities."""
-    async_add_entities([SophiaNLUConversationEntity(config_entry)])
+    """Set up conversation entities, emulating home if yaml_file is configured."""
+    yaml_file = hass.data.get(DOMAIN, {}).get("yaml_file")
 
+    entity = SophiaNLUConversationEntity(config_entry)
+    if yaml_file:
+        from .sandbox import async_emulate_sandbox_home
+        try:
+            await async_emulate_sandbox_home(hass, yaml_file)
+        except FileNotFoundError as err:
+            _LOGGER.error("Sandbox yaml_file not found: %s", err)
+        except Exception as err:
+            _LOGGER.exception("Failed to emulate sandbox home from %s: %s", yaml_file, err)
 
-class SophiaNLUConversationEntity(
-    conversation.ConversationEntity, conversation.AbstractConversationAgent
-):
+    async_add_entities([entity])
+
+class SophiaNLUConversationEntity(conversation.ConversationEntity):
     """Sophia NLU conversation agent entity."""
 
     _attr_has_entity_name = True
@@ -56,7 +65,10 @@ class SophiaNLUConversationEntity(
         self.entry = entry
         self._host = entry.data[CONF_HOST]
         self._port = entry.data[CONF_PORT]
+        self.emulated_home = None
+
         self._attr_unique_id = entry.entry_id
+        self.entity_id = f"conversation.{entry.domain}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self.entry.entry_id)},
             name="Sophia NLU Engine",
@@ -69,6 +81,11 @@ class SophiaNLUConversationEntity(
         """Return a list of supported languages."""
         return ["en"]
 
+    @property
+    def attribution(self) -> conversation.AgentAttribution | None:
+        """Return attribution for conversation agent."""
+        return "Sophia NLU (https://nlu.to/ha/)"
+
     async def async_added_to_hass(self) -> None:
         """When entity is added to Home Assistant."""
         await super().async_added_to_hass()
@@ -79,44 +96,20 @@ class SophiaNLUConversationEntity(
         conversation.async_unset_agent(self.hass, self.entry)
         await super().async_will_remove_from_hass()
 
-    async def _async_send_to_nlu(
-        self, text: str, conversation_id: str, language: str, is_reply: bool = False
-    ) -> list[dict]:
-        """Send a Wyoming 'recognize' request to the Sophia NLU server and return parsed JSON responses.
-
-        The server may return multiple newline-separated JSON objects (JSONL)
-        when multiple intents are detected.  Each non-empty line is parsed and
-        returned as a separate dict in the list.
-        """
+    async def _async_send_payload(self, payload_dict: dict[str, Any]) -> list[dict]:
+        """Send a raw JSON payload over TCP to the NLU server and return parsed JSON responses."""
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(self._host, self._port), timeout=5.0
         )
         try:
-            request = json.dumps(
-                {
-                    "type": "recognize",
-                    "data": {
-                        "text": text,
-                        "language": language,
-                        "session_id": conversation_id,
-                        "context": {"is_reply": 1 if is_reply else 0},
-                    },
-                },
-                separators=(",", ":"),
-            )
+            request = json.dumps(payload_dict, separators=(",", ":"))
             payload = f"{request}\n"
-            # payload = f"{len(request)}\n{request}\n"
             writer.write(payload.encode("utf-8"))
             await writer.drain()
 
-            # Signal we are done sending so the server sees EOF on its read half.
-            # This also prompts the server task to finish and close the connection,
-            # allowing our read() below to complete instead of hanging.
             if writer.can_write_eof():
                 writer.write_eof()
 
-            # Server responds with raw JSON (no length prefix).  Read all data until the
-            # server closes the connection, then parse each line as a separate JSON object.
             data = await asyncio.wait_for(reader.read(65536), timeout=10.0)
             _LOGGER.debug(
                 "Sophia NLU raw response (%d bytes): %s", len(data), data[:512]
@@ -133,47 +126,48 @@ class SophiaNLUConversationEntity(
             writer.close()
             await writer.wait_closed()
 
+
+    async def _async_send_to_nlu(
+        self, text: str, conversation_id: str, language: str, is_reply: bool = False
+    ) -> list[dict]:
+
+        request = {
+            "type": "recognize",
+            "data": {
+                "text": text,
+                "language": language,
+                "session_id": conversation_id,
+                "context": {"is_reply": 1 if is_reply else 0},
+            },
+        }
+
+        try:
+            results = await self._async_send_payload(request)
+            return results
+        except Exception as err:
+            _LOGGER.error(f"Failed to send recognize command to Sophia NLU: {err}")
+
+
     async def _async_send_response(
         self,
         session_id: str,
         intents: list[dict[str, Any]],
     ) -> str:
         """Send a 'response' request to the NLU server with per-intent results and return the output text."""
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(self._host, self._port), timeout=5.0
-        )
-        try:
-            context: dict[str, Any] = {
+
+        request = {
+            "type": "response",
+            "data": {"context": {
                 "session_id": session_id,
                 "intents": intents,
-            }
+            }}
+        }
 
-            request = json.dumps(
-                {"type": "response", "data": {"context": context}},
-                separators=(",", ":"),
-            )
-            payload = f"{request}\n"
-            writer.write(payload.encode("utf-8"))
-            await writer.drain()
-
-            if writer.can_write_eof():
-                writer.write_eof()
-
-            data = await asyncio.wait_for(reader.read(65536), timeout=10.0)
-            _LOGGER.debug(
-                "Sophia NLU response raw (%d bytes): %s", len(data), data[:512]
-            )
-            text_resp = data.decode("utf-8").strip()
-            if not text_resp:
-                _LOGGER.error(
-                    "Sophia NLU returned empty response to 'response' request"
-                )
-                return ""
-            result = json.loads(text_resp)
-            return result.get("data", {}).get("text", "")
-        finally:
-            writer.close()
-            await writer.wait_closed()
+        try:
+            results = await self._async_send_payload(request)
+            return results[0].get("data", {}).get("text", "")
+        except Exception as err:
+            _LOGGER.error(f"Failed to send response command to Sophia NLU: {err}")
 
     def _build_state_entry(self, state_obj: State) -> dict[str, Any]:
         """Build an enriched success entry dict from a HA State object."""
