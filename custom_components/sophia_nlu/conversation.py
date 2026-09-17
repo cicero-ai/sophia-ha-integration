@@ -59,7 +59,6 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
     _attr_has_entity_name = True
     _attr_name = None
     _attr_supports_streaming = False
-    conversation.ConversationEntityFeature.CONTROL
 
     def __init__(self, entry: ConfigEntry) -> None:
         """Initialize the entity."""
@@ -96,6 +95,19 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
         """When entity will be removed from Home Assistant."""
         conversation.async_unset_agent(self.hass, self.entry)
         await super().async_will_remove_from_hass()
+
+    def _is_entity_usable(self, entity_entry: er.RegistryEntry) -> bool:
+        """Return True if the entity is enabled and exposed to conversation."""
+        # 1. Must not be disabled
+        if entity_entry.disabled_by is not None:
+            return False
+
+        # 2. Must be exposed to the conversation agent
+        conversation_opts = entity_entry.options.get("conversation", {})
+        if not conversation_opts.get("should_expose", False):
+            return False
+
+        return True
 
     async def _async_send_payload(self, payload_dict: dict[str, Any]) -> list[dict]:
         """Send a raw JSON payload over TCP to the NLU server and return parsed JSON responses."""
@@ -371,6 +383,10 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                 if domain and entity_entry.domain != domain:
                     continue
 
+                # Check if entity exposed
+                if not self._is_entity_usable(entity_entry):
+                    continue
+
                 # Check if entity belongs to an area directly
                 if entity_entry.area_id in area_ids:
                     resolved_entities.append(entity_entry.entity_id)
@@ -386,8 +402,11 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
 
         # 4. Fallback: Grab all entities in the domain if no targeting criteria matched
         if domain:
+            entity_reg = er.async_get(self.hass)
             return [
-                state_obj.entity_id for state_obj in self.hass.states.async_all(domain)
+                entry.entity_id
+                for entry in entity_reg.entities.values()
+                if entry.domain == domain and self._is_entity_usable(entry)
             ]
 
         return []
@@ -407,10 +426,92 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
         }
         payload = {}
         for key, slot_dict in slots.items():
-            if key not in excluded_slots:
-                val = slot_dict.get("value")
-                if val is not None:
-                    payload[key] = val
+            if key in excluded_slots:
+                continue
+
+            val = slot_dict.get("value")
+            if val is None:
+                continue
+
+            # Brightness Handling
+            if key == "brightness":
+                if val == "down":
+                    payload["brightness_step_pct"] = -20
+                elif val == "up":
+                    payload["brightness_step_pct"] = 20
+                else:
+                    try:
+                        # Convert percentage or scale directly
+                        payload["brightness_pct"] = int(val)
+                    except ValueError:
+                        pass
+
+            # Color Name Handling
+            elif key in ("color", "color_name"):
+                payload["color_name"] = str(val).lower()
+
+            # Color Temp Handling
+            elif key == "color_temp":
+                if val == "warm":
+                    payload["color_temp_kelvin"] = 2700
+                elif val == "cold" or val == "cool":
+                    payload["color_temp_kelvin"] = 5000
+                else:
+                    try:
+                        payload["color_temp_kelvin"] = int(val)
+                    except ValueError:
+                        pass
+
+            # Position / Cover Handling (e.g., blinds, curtains, shades)
+            elif key in ("position", "cover_position"):
+                if val in ("open", "up"):
+                    payload["position"] = 100
+                elif val in ("close", "closed", "down"):
+                    payload["position"] = 0
+                else:
+                    try:
+                        payload["position"] = int(val)
+                    except ValueError:
+                        pass
+
+            # Cover Relative Steps
+            elif key == "position":
+                if val in ("up", "open", "increase"):
+                    payload["position"] = 100 
+                elif val in ("down", "close", "decrease"):
+                    payload["position"] = 0
+
+            # Percentage Handling (e.g., fan speeds, generic percentages)
+            elif key == "percentage":
+                if val in ("up", "increase", "higher"):
+                    # Standard fan or speed step
+                    payload["percentage_step"] = 20
+                elif val in ("down", "decrease", "lower"):
+                    payload["percentage_step"] = -20
+                else:
+                    try:
+                        payload["percentage"] = int(val)
+                    except ValueError:
+                        pass
+
+            # Volume & Volume Steps (e.g., media players)
+            elif key in ("volume", "volume_level"):
+                try:
+                    # HA volume_level expects float between 0.0 and 1.0
+                    raw_val = float(val)
+                    payload["volume_level"] = raw_val / 100.0 if raw_val > 1.0 else raw_val
+                except ValueError:
+                    pass
+
+            elif key == "volume_step":
+                if val in ("up", "increase", "louder"):
+                    payload["volume_up"] = True  # Used directly with media_player.volume_up service
+                elif val in ("down", "decrease", "softer", "quieter"):
+                    payload["volume_down"] = True  # Used directly with media_player.volume_down service
+
+            else:
+                payload[key] = val
+
         return payload
 
     async def async_handle_standard_intent(
@@ -612,6 +713,7 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
         last_intent_result: intent.IntentResponse | None = None
         session_id: str | None = None
         intents_context: list[dict[str, Any]] = []
+        script_response_text: str | None = None
 
         for result in results:
             # Wyoming error response
@@ -695,25 +797,37 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                     service_data["entity_id"] = entity_id
 
                     try:
-                        await self.hass.services.async_call(
+                        return_response = entity_id.startswith("script.")
+                        service_result = await self.hass.services.async_call(
                             service_domain,
                             service_name,
                             service_data,
                             blocking=True,
+                            return_response=return_response,
                         )
-                        _LOGGER.debug(
-                            "Bypassed intent pipeline. Fired service %s.%s with %s",
-                            service_domain,
-                            service_name,
-                            service_data,
-                        )
+                        _LOGGER.debug("Bypassed intent pipeline. Fired service %s.%s with %s", service_domain, service_name, service_data)
                         intent_entry["response_type"] = "action_done"
+
+                        if return_response and service_result:
+                            # Common shapes: plain string, or dict with a useful key
+                            if isinstance(service_result, str) and service_result.strip():
+                                script_response_text = service_result.strip()
+                            elif isinstance(service_result, dict):
+                                # Prefer explicit conversation-style keys first
+                                for key in ("speech", "text", "message", "response"):
+                                    val = service_result.get(key)
+                                    if isinstance(val, str) and val.strip():
+                                        script_response_text = val.strip()
+                                        break
+                                # Fallback: first non-empty string value
+                                if script_response_text is None:
+                                    for v in service_result.values():
+                                        if isinstance(v, str) and v.strip():
+                                            script_response_text = v.strip()
+                                            break
+
                     except Exception as err:
-                        _LOGGER.error(
-                            "Direct execution fallback failed for %s: %s",
-                            entity_id,
-                            err,
-                        )
+                        _LOGGER.error("Direct execution fallback failed for %s: %s", entity_id, err)
                         intent_entry["response_type"] = "error"
                         continue
 
@@ -730,7 +844,9 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                 last_intent_result.response_type = intent.IntentResponseType.ACTION_DONE
 
         # Send per-intent results back to the NLU engine to generate output text
-        if session_id:
+        if script_response_text:
+            final_speech = script_response_text
+        elif session_id:
             try:
                 final_speech = await self._async_send_response(
                     session_id,
@@ -743,9 +859,7 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                 _LOGGER.exception("Error getting response text from Sophia NLU")
                 final_speech = ""
         else:
-            _LOGGER.warning(
-                "No session_id in NLU response; cannot generate output text"
-            )
+            _LOGGER.warning("No session_id in NLU response; cannot generate output text")
             final_speech = ""
 
         # Finish up: set the output text and return the conversation result to HA
