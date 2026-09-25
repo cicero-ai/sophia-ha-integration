@@ -7,6 +7,7 @@ import dataclasses
 import json
 import logging
 import time
+from datetime import date
 from typing import Any, Literal
 
 from homeassistant.components import conversation
@@ -23,7 +24,7 @@ from homeassistant.helpers import (
 
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.util import ulid
+from homeassistant.util import dt as dt_util, ulid
 
 from .const import CONF_HOST, CONF_PORT, DOMAIN, get_service_call
 
@@ -654,6 +655,54 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
 
         return True, entity_payload
 
+    def _pick_tomorrow_forecast(self, forecast_list: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Return the daily forecast entry for tomorrow, if available."""
+        today = dt_util.now().date()
+        dated: list[tuple[date, dict[str, Any]]] = []
+        for entry in forecast_list:
+            raw = entry.get("datetime")
+            parsed = dt_util.parse_datetime(str(raw)) if raw is not None else None
+            if parsed is None:
+                continue
+            dated.append((dt_util.as_local(parsed).date(), entry))
+        future = [item for item in dated if item[0] > today]
+        if future:
+            future.sort(key=lambda item: item[0])
+            return future[0][1]
+        if len(forecast_list) > 1:
+            return forecast_list[1]
+        return forecast_list[0] if forecast_list else None
+
+    async def _async_apply_tomorrow_forecast(self, entity_id: str, entity: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        """Replace current weather on the entity payload with tomorrow's daily forecast."""
+        try:
+            result = await self.hass.services.async_call("weather", "get_forecasts", {"type": "daily", "entity_id": entity_id}, blocking=True, return_response=True)
+        except Exception as err:
+            _LOGGER.error("Failed to get tomorrow forecast for %s: %s", entity_id, err)
+            entity["reason"] = "forecast_unavailable"
+            return False, entity
+
+        forecast_list: list[dict[str, Any]] = []
+        if isinstance(result, dict):
+            forecast_list = (result.get(entity_id) or {}).get("forecast") or []
+        tomorrow = self._pick_tomorrow_forecast(forecast_list)
+        if not tomorrow:
+            entity["reason"] = "forecast_unavailable"
+            return False, entity
+
+        if condition := tomorrow.get("condition"):
+            entity["state"] = condition
+        attrs = entity.setdefault("attributes", {})
+        for key, val in tomorrow.items():
+            if key == "condition" or val is None:
+                continue
+            try:
+                json.dumps(val)
+            except (TypeError, ValueError):
+                continue
+            attrs[key] = val
+        return True, entity
+
     async def async_process(
         self, user_input: conversation.ConversationInput
     ) -> conversation.ConversationResult:
@@ -833,6 +882,8 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
 
                 # Get entity
                 is_success, entity = await self.async_get_entity(entity_id, common_name)
+                if is_success and intent_name == "HassGetWeather" and slots.get("time", {}).get("value") == "tomorrow":
+                    is_success, entity = await self._async_apply_tomorrow_forecast(entity_id, entity)
                 if is_success:
                     intent_entry["success"].append(entity)
                 else:
