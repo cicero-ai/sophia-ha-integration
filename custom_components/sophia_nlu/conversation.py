@@ -51,7 +51,7 @@ async def async_setup_entry(
     entity_reg = er.async_get(hass)
     existing_id = entity_reg.async_get_entity_id("conversation", DOMAIN, config_entry.entry_id)
     if existing_id == f"conversation.{DOMAIN}":
-        entity_reg.async_update_entity(existing_id, new_entity_id="conversation.sophia_nlu_engine")
+        entity_reg.async_update_entity(existing_id, new_entity_id="conversation.sophia_nlu")
 
     entity = SophiaNLUConversationEntity(config_entry)
     if yaml_file:
