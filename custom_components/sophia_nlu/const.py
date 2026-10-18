@@ -66,6 +66,7 @@ _TURN_ON_OVERRIDES: dict[str, tuple[str, str]] = {
     "lock":     ("lock", "lock"),
     "valve":    ("valve", "open_valve"),
     "siren":    ("siren", "turn_on"),
+    "script":   ("script", "turn_on"),
 }
 
 _TURN_OFF_OVERRIDES: dict[str, tuple[str, str]] = {
@@ -73,6 +74,68 @@ _TURN_OFF_OVERRIDES: dict[str, tuple[str, str]] = {
     "lock":     ("lock", "unlock"),
     "valve":    ("valve", "close_valve"),
 }
+
+
+# Standard HA intents that should use NLU-generated speech responses
+STANDARD_INTENTS = frozenset([
+    "HassGetState",
+    "HassNevermind",
+    "HassGetCurrentDate",
+    "HassGetCurrentTime",
+    "HassStartTimer",
+    "HassCancelTimer",
+    "HassCancelAllTimers",
+    "HassIncreaseTimer",
+    "HassDecreaseTimer",
+    "HassPauseTimer",
+    "HassUnpauseTimer",
+    "HassTimerStatus",
+    "HassTurnOn",
+    "HassTurnOff",
+    "HassToggle",
+    "HassOpenCover",
+    "HassCloseCover",
+    "HassSetPosition",
+    "HassStopMoving",
+    "HassLightSet",
+    "HassClimateSetTemperature",
+    "HassClimateGetTemperature",
+    "HassMediaPause",
+    "HassMediaUnpause",
+    "HassMediaNext",
+    "HassMediaPrevious",
+    "HassMediaPlayerMute",
+    "HassMediaPlayerUnmute",
+    "HassSetVolume",
+    "HassSetVolumeRelative",
+    "HassMediaSearchAndPlay",
+    "HassFanSetSpeed",
+    "HassHumidifierSetpoint",
+    "HassHumidifierMode",
+    "HassVacuumStart",
+    "HassVacuumReturnToBase",
+    "HassVacuumCleanArea",
+    "HassGetWeather",
+    "HassShoppingListAddItem",
+    "HassShoppingListCompleteItem",
+    "HassShoppingListLastItems",
+    "HassListAddItem",
+    "HassListCompleteItem",
+    "HassLawnMowerStartMowing",
+    "HassLawnMowerDock",
+    "HassBroadcast",
+    "HassAlarmSetMode",
+    "HassAlarmDisarm",
+    "HassAlarmTrigger",
+])
+
+
+def is_standard_intent(intent_name: str) -> bool:
+    """Check if an intent is a standard HA intent that should use NLU-generated speech.
+
+    Returns True if the intent is in the standard list, False for custom intents.
+    """
+    return intent_name in STANDARD_INTENTS
 
 
 def get_service_call(intent_name: str, entity_domain: str | None = None) -> tuple[str, str] | None:

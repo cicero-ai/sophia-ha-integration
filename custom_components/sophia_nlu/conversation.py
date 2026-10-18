@@ -26,12 +26,18 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util, ulid
 
-from .const import CONF_HOST, CONF_PORT, DOMAIN, get_service_call
+from .const import CONF_HOST, CONF_PORT, DOMAIN, get_service_call, is_standard_intent
 
 _LOGGER = logging.getLogger(__name__)
 
 # Sentinel used by _sanitize() to signal a value cannot be JSON-serialized
 _UNSERIALIZABLE = object()
+
+# Alarm intents handled directly via alarm_control_panel service calls
+ALARM_DOMAIN = "alarm_control_panel"
+ALARM_INTENTS = frozenset(["HassAlarmSetMode", "HassAlarmDisarm", "HassAlarmTrigger"])
+ALARM_FIXED_SERVICES: dict[str, str] = {"HassAlarmDisarm": "alarm_disarm", "HassAlarmTrigger": "alarm_trigger"}
+ALARM_MODE_SERVICES: dict[str, str] = {"home": "alarm_arm_home", "away": "alarm_arm_away", "night": "alarm_arm_night", "vacation": "alarm_arm_vacation", "custom_bypass": "alarm_arm_custom_bypass", "custom": "alarm_arm_custom_bypass"}
 
 
 async def async_setup_entry(
@@ -41,6 +47,11 @@ async def async_setup_entry(
 ) -> None:
     """Set up conversation entities, emulating home if yaml_file is configured."""
     yaml_file = hass.data.get(DOMAIN, {}).get("yaml_file")
+
+    entity_reg = er.async_get(hass)
+    existing_id = entity_reg.async_get_entity_id("conversation", DOMAIN, config_entry.entry_id)
+    if existing_id == f"conversation.{DOMAIN}":
+        entity_reg.async_update_entity(existing_id, new_entity_id="conversation.sophia_nlu_engine")
 
     entity = SophiaNLUConversationEntity(config_entry)
     if yaml_file:
@@ -69,7 +80,6 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
         self.emulated_home = None
 
         self._attr_unique_id = entry.entry_id
-        self.entity_id = f"conversation.{entry.domain}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self.entry.entry_id)},
             name="Sophia NLU Engine",
@@ -142,8 +152,12 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
 
 
     async def _async_send_to_nlu(
-        self, text: str, conversation_id: str, language: str, is_reply: bool = False
+        self, text: str, conversation_id: str, language: str, is_reply: bool = False, device_id: str | None = None
     ) -> list[dict]:
+
+        context: dict[str, Any] = {"is_reply": 1 if is_reply else 0}
+        if device_id:
+            context["device_id"] = device_id
 
         request = {
             "type": "recognize",
@@ -151,37 +165,51 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                 "text": text,
                 "language": language,
                 "session_id": conversation_id,
-                "context": {"is_reply": 1 if is_reply else 0},
+                "context": context,
             },
         }
 
         try:
             results = await self._async_send_payload(request)
             return results
+        except (OSError, asyncio.TimeoutError):
+            raise
         except Exception as err:
-            _LOGGER.error(f"Failed to send recognize command to Sophia NLU: {err}")
+            _LOGGER.error("Failed to send recognize command to Sophia NLU: %s", err)
+            return []
 
 
     async def _async_send_response(
         self,
         session_id: str,
         intents: list[dict[str, Any]],
+        text: str | None = None,
     ) -> str:
-        """Send a 'response' request to the NLU server with per-intent results and return the output text."""
+        """Send a 'response' request to the NLU server with per-intent results and return the output text.
 
-        request = {
+        If text is provided (custom script / intent response), it is included as data.text so the NLU server can log it.
+        """
+
+        request: dict[str, Any] = {
             "type": "response",
             "data": {"context": {
                 "session_id": session_id,
                 "intents": intents,
             }}
         }
+        if text:
+            request["data"]["text"] = text
 
         try:
             results = await self._async_send_payload(request)
+            if not results:
+                return ""
             return results[0].get("data", {}).get("text", "")
+        except (OSError, asyncio.TimeoutError):
+            raise
         except Exception as err:
-            _LOGGER.error(f"Failed to send response command to Sophia NLU: {err}")
+            _LOGGER.error("Failed to send response command to Sophia NLU: %s", err)
+            return ""
 
     def _build_state_entry(self, state_obj: State) -> dict[str, Any]:
         """Build an enriched success entry dict from a HA State object."""
@@ -321,8 +349,11 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
         if "name" in slots and domain:
             name_slot = slots["name"].get("value", "").strip()
             if name_slot:
+                name_lower = name_slot.lower()
+                name_slug = name_lower.replace(" ", "_")
                 for state_obj in self.hass.states.async_all(domain):
-                    if state_obj.name.lower() == name_slot.lower():
+                    object_id = state_obj.entity_id.split(".", 1)[-1]
+                    if state_obj.name.lower() == name_lower or object_id == name_slug or object_id.replace("_", " ") == name_lower:
                         return [state_obj.entity_id]
                 _LOGGER.warning(
                     "No entity found in domain '%s' matching name '%s'",
@@ -520,7 +551,7 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
         intent_name: str,
         slots: dict[str, Any],
         user_input: conversation.ConversationInput,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], str | None]:
         text = user_input.text
         language = user_input.language or "en"
 
@@ -557,7 +588,7 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                 "failed": [],
                 "error": intent_err_msg or "unknown error",
             }
-            return intent_entry
+            return intent_entry, None
 
         success_list = []
         for t in intent_result.success_results:  # type: ignore[union-attr]
@@ -581,10 +612,12 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
             response_type_val = intent_result.response_type.value
             failed_list = [dataclasses.asdict(t) for t in intent_result.failed_results]
             speech_slots_val = intent_result.speech_slots or None
+            speech_text = intent_result.speech.get("plain", {}).get("speech", "") if intent_result.speech else ""
         else:
             response_type_val = "action_done"
             failed_list = []
             speech_slots_val = None
+            speech_text = ""
 
         intent_entry = {
             "response_type": response_type_val,
@@ -596,7 +629,7 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
         if intent_err_msg:
             intent_entry["error"] = intent_err_msg
 
-        return intent_entry
+        return intent_entry, speech_text or None
 
     async def async_get_entity(
         self, entity_id: str, common_name: str | None
@@ -703,6 +736,258 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
             attrs[key] = val
         return True, entity
 
+    def _speech_from_payload(self, payload: Any) -> str | None:
+        """Return the first speech-like string found in a service response.
+
+        Responses can be a plain string, a dict with a speech/text/message/
+        response key, or a dict keyed by entity_id wrapping such a value.
+        """
+        if isinstance(payload, str):
+            return payload.strip() or None
+        if not isinstance(payload, dict):
+            return None
+        for key in ("speech", "text", "message", "response"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        for v in payload.values():
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            nested = self._speech_from_payload(v)
+            if nested:
+                return nested
+        return None
+
+    def _render_static_value(self, val: Any, variables: dict[str, Any] | None = None) -> str | None:
+        """Render a static config value that may be a string or Template."""
+        if isinstance(val, str):
+            return val.strip() or None
+        if hasattr(val, "async_render"):
+            try:
+                rendered = val.async_render(variables or {}, parse_result=False)
+                return str(rendered).strip() or None
+            except Exception:
+                return None
+        return None
+
+    def _find_conversation_response(
+        self, actions: list, variables: dict[str, Any] | None = None
+    ) -> str | None:
+        speech = None
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            if "set_conversation_response" in action:
+                val = action.get("set_conversation_response")
+                if val is None:
+                    speech = None
+                else:
+                    rendered = self._render_static_value(val, variables)
+                    if rendered is not None:
+                        speech = rendered
+            for key in ("sequence", "then", "else", "default"):
+                nested = action.get(key)
+                if isinstance(nested, list):
+                    found = self._find_conversation_response(nested, variables)
+                    if found is not None:
+                        speech = found
+            choose = action.get("choose")
+            if isinstance(choose, list):
+                for choice in choose:
+                    if isinstance(choice, dict) and isinstance(choice.get("sequence"), list):
+                        found = self._find_conversation_response(choice["sequence"], variables)
+                        if found is not None:
+                            speech = found
+            repeat = action.get("repeat")
+            if isinstance(repeat, dict) and isinstance(repeat.get("sequence"), list):
+                found = self._find_conversation_response(repeat["sequence"], variables)
+                if found is not None:
+                    speech = found
+            if_action = action.get("if")
+            if isinstance(if_action, list):
+                for branch in if_action:
+                    if isinstance(branch, dict):
+                        for key in ("then", "else"):
+                            nested = branch.get(key)
+                            if isinstance(nested, list):
+                                found = self._find_conversation_response(nested, variables)
+                                if found is not None:
+                                    speech = found
+            parallel = action.get("parallel")
+            if isinstance(parallel, list):
+                for branch in parallel:
+                    if isinstance(branch, dict):
+                        nested = branch.get("sequence")
+                        if isinstance(nested, list):
+                            found = self._find_conversation_response(nested, variables)
+                            if found is not None:
+                                speech = found
+                    elif isinstance(branch, list):
+                        found = self._find_conversation_response(branch, variables)
+                        if found is not None:
+                            speech = found
+        return speech
+
+    def _static_script_speech(
+        self, entity_id: str, variables: dict[str, Any] | None = None
+    ) -> str | None:
+        component = self.hass.data.get("script")
+        if component is None or not hasattr(component, "get_entity"):
+            return None
+        script_entity = component.get_entity(entity_id)
+        raw = getattr(script_entity, "raw_config", None) if script_entity is not None else None
+        if not isinstance(raw, dict):
+            return None
+        sequence = raw.get("sequence") or []
+        if not isinstance(sequence, list):
+            return None
+        return self._find_conversation_response(sequence, variables)
+
+    async def _async_run_script(self, entity_id: str, variables: dict[str, Any], context: Any) -> str | None:
+        """Run a script entity once and return its conversation speech, if any.
+
+        Runs via the script entity's Script object directly so both
+        conversation_response (from set_conversation_response) and
+        service_response (from response_variable, even non-dict values) are
+        captured without HA's dict-only service validation or double execution.
+        Falls back to service calls for mocked environments without entities.
+        """
+        component = self.hass.data.get("script")
+        script_entity = None
+        if component is not None and hasattr(component, "get_entity"):
+            try:
+                script_entity = component.get_entity(entity_id)
+            except Exception:
+                script_entity = None
+
+        script_obj = getattr(script_entity, "script", None) if script_entity is not None else None
+        if script_obj is not None and hasattr(script_obj, "async_run"):
+            result = await script_obj.async_run(variables or {}, context)
+            if result is not None:
+                conv = getattr(result, "conversation_response", None)
+                if isinstance(conv, str) and conv.strip():
+                    return conv.strip()
+                svc = getattr(result, "service_response", None)
+                speech = self._speech_from_payload(svc)
+                if speech:
+                    return speech
+            return self._static_script_speech(entity_id, variables)
+
+        object_id = entity_id.split(".", 1)[-1]
+        if self.hass.services.has_service("script", object_id):
+            try:
+                result = await self.hass.services.async_call(
+                    "script", object_id, variables, blocking=True,
+                    context=context, return_response=True,
+                )
+            except Exception:
+                result = None
+            return self._speech_from_payload(result) or self._static_script_speech(entity_id, variables)
+
+        turn_on_data: dict[str, Any] = {"entity_id": entity_id}
+        if variables:
+            turn_on_data["variables"] = variables
+        await self.hass.services.async_call(
+            "script", "turn_on", turn_on_data, blocking=True, context=context
+        )
+        return self._static_script_speech(entity_id, variables)
+
+    async def _async_try_script_by_name(
+        self, intent_name: str, slots: dict[str, Any], context: Any
+    ) -> tuple[bool, str | None, str | None]:
+        """Run a script whose entity_id or friendly name matches a custom intent.
+
+        Returns (handled, speech, entity_id). Used when no intent_script
+        handler exists for the custom intent name.
+        """
+        candidates: list[str] = []
+        normalized = intent_name.strip().lower().replace(" ", "_").replace("-", "_")
+        normalized = "".join(c for c in normalized if c.isalnum() or c == "_")
+        if normalized:
+            candidates.append(f"script.{normalized}")
+
+        for state_obj in self.hass.states.async_all("script"):
+            name_lower = state_obj.name.lower()
+            intent_lower = intent_name.strip().lower()
+            object_id = state_obj.entity_id.split(".", 1)[-1]
+            if (
+                name_lower == intent_lower
+                or object_id == normalized
+                or object_id.replace("_", " ") == intent_lower
+            ):
+                if state_obj.entity_id not in candidates:
+                    candidates.append(state_obj.entity_id)
+
+        for entity_id in candidates:
+            exists = (
+                self.hass.states.get(entity_id) is not None
+                or self.hass.services.has_service("script", entity_id.split(".", 1)[-1])
+            )
+            if not exists:
+                component = self.hass.data.get("script")
+                if component is not None and hasattr(component, "get_entity"):
+                    try:
+                        exists = component.get_entity(entity_id) is not None
+                    except Exception:
+                        exists = False
+            if not exists:
+                continue
+            service_data = self._extract_service_payload(slots)
+            speech = await self._async_run_script(entity_id, service_data, context)
+            return True, speech, entity_id
+        return False, None, None
+
+    async def _async_handle_alarm_intent(self, intent_name: str, slots: dict[str, Any], common_name: str | None, context: Any) -> dict[str, Any]:
+        """Execute an alarm intent via alarm_control_panel services and return the per-intent context entry.
+
+        Validation failures (missing entity or bad mode) produce an error entry without any service call; speech is generated by the NLU engine from the entry.
+        """
+        intent_entry: dict[str, Any] = {"response_type": "action_done", "success": [], "failed": []}
+
+        entity_id = str(slots.get("entity_id", {}).get("value") or "").strip()
+        if not entity_id:
+            _LOGGER.error("%s received without an entity_id slot", intent_name)
+            intent_entry.update({"response_type": "error", "error": "missing_entity_id"})
+            return intent_entry
+
+        # Determine service
+        if intent_name == "HassAlarmSetMode":
+            raw_mode = str(slots.get("mode", {}).get("value") or "").strip()
+            mode = raw_mode.lower().replace(" ", "_").replace("-", "_")
+            service_name = ALARM_MODE_SERVICES.get(mode)
+            if service_name is None:
+                if not raw_mode:
+                    _LOGGER.error("HassAlarmSetMode received without a mode slot for %s", entity_id)
+                    intent_entry.update({"response_type": "error", "error": "missing_alarm_mode"})
+                    return intent_entry
+                _LOGGER.error("HassAlarmSetMode received unrecognized mode '%s' for %s", raw_mode, entity_id)
+                intent_entry.update({"response_type": "error", "error": "invalid_alarm_mode", "mode": raw_mode})
+                return intent_entry
+        else:
+            service_name = ALARM_FIXED_SERVICES[intent_name]
+
+        # Only pass code if provided and the entity actually accepts one
+        service_data: dict[str, Any] = {"entity_id": entity_id}
+        code = slots.get("code", {}).get("value")
+        state_obj = self.hass.states.get(entity_id)
+        if code is not None and str(code).strip() and state_obj is not None and state_obj.attributes.get("code_format") is not None:
+            service_data["code"] = str(code).strip()
+
+        try:
+            await self.hass.services.async_call(ALARM_DOMAIN, service_name, service_data, blocking=True, context=context)
+            _LOGGER.debug("Fired alarm service %s.%s for %s (code provided: %s)", ALARM_DOMAIN, service_name, entity_id, "code" in service_data)
+        except Exception as err:
+            _LOGGER.error("Alarm service %s.%s failed for %s: %s", ALARM_DOMAIN, service_name, entity_id, err)
+            intent_entry.update({"response_type": "error", "error": self._normalize_intent_error(err)})
+            return intent_entry
+
+        is_success, entity = await self.async_get_entity(entity_id, common_name)
+        if is_success:
+            intent_entry["success"].append(entity)
+        else:
+            intent_entry["failed"].append(entity)
+        return intent_entry
+
     async def async_process(
         self, user_input: conversation.ConversationInput
     ) -> conversation.ConversationResult:
@@ -721,7 +1006,7 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
         is_reply = self._is_reply(conversation_id)
         try:
             results = await self._async_send_to_nlu(
-                text, conversation_id, language, is_reply
+                text, conversation_id, language, is_reply, user_input.device_id
             )
         except (OSError, asyncio.TimeoutError) as err:
             _LOGGER.error(
@@ -763,6 +1048,7 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
         session_id: str | None = None
         intents_context: list[dict[str, Any]] = []
         script_response_text: str | None = None
+        custom_intent_speech: str | None = None
 
         for result in results:
             # Wyoming error response
@@ -800,15 +1086,56 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                 if slot_name:
                     slots[slot_name] = {"value": slot_value}
 
-                if "common_name" in slots:
-                    common_name = slots["common_name"].get("value")
-                else:
-                    common_name = None
+            if "common_name" in slots:
+                common_name = slots["common_name"].get("value")
+            else:
+                common_name = None
 
             # Get entity IDs
             devices = self._resolve_entities_from_slots(slots)
             if len(devices) != 1:
                 common_name = None
+
+            # Alarm intents map directly to alarm_control_panel services
+            if intent_name in ALARM_INTENTS:
+                intents_context.append(await self._async_handle_alarm_intent(intent_name, slots, common_name, user_input.context))
+                if last_intent_result is None:
+                    last_intent_result = intent.IntentResponse(language=language)
+                    last_intent_result.response_type = intent.IntentResponseType.ACTION_DONE
+                continue
+
+            if not is_standard_intent(intent_name):
+                # Custom intents with an intent_script handler fall through to
+                # standard HA handling below (ScriptIntentHandler executes the
+                # action and renders speech). Only when no handler exists, try
+                # a script with a matching entity_id or friendly name.
+                has_handler = isinstance(
+                    (self.hass.data.get("intent_script") or {}).get(intent_name), dict
+                )
+                if not has_handler:
+                    try:
+                        handled, speech, script_entity = await self._async_try_script_by_name(
+                            intent_name, slots, user_input.context
+                        )
+                    except Exception as err:
+                        _LOGGER.error("Script fallback for %s failed: %s", intent_name, err)
+                        handled, speech, script_entity = False, None, None
+                    if handled and script_entity:
+                        is_success, script_state = await self.async_get_entity(
+                            script_entity, common_name
+                        )
+                        script_entry: dict[str, Any] = {
+                            "response_type": "action_done",
+                            "success": [script_state] if is_success else [],
+                            "failed": [] if is_success else [script_state],
+                        }
+                        intents_context.append(script_entry)
+                        if speech:
+                            script_response_text = speech
+                        if last_intent_result is None:
+                            last_intent_result = intent.IntentResponse(language=language)
+                            last_intent_result.response_type = intent.IntentResponseType.ACTION_DONE
+                        continue
 
             # Standard HA intent system
             if (
@@ -817,10 +1144,35 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                 or "List" in intent_name
                 or intent_name in ["HassBroadcast", "HassNevermind"]
             ):
-                intent_entry = await self.async_handle_standard_intent(
+                intent_entry, speech_text = await self.async_handle_standard_intent(
                     intent_name, slots, user_input
                 )
                 intents_context.append(intent_entry)
+
+                if not is_standard_intent(intent_name) and speech_text:
+                    custom_intent_speech = speech_text
+
+                if last_intent_result is None:
+                    last_intent_result = intent.IntentResponse(language=language)
+                    last_intent_result.response_type = (
+                        intent.IntentResponseType.ACTION_DONE
+                    )
+                continue
+
+            entity_domain = devices[0].split(".")[0]
+            service_target = get_service_call(intent_name, entity_domain)
+
+            # Fallback to standard HA intent handling if no service mapping exists
+            if service_target is None:
+                _LOGGER.debug("No service mapping for %s + %s, falling back to standard intent handling", intent_name, entity_domain)
+                intent_entry, speech_text = await self.async_handle_standard_intent(
+                    intent_name, slots, user_input
+                )
+                intents_context.append(intent_entry)
+
+                # Capture speech for custom intents
+                if not is_standard_intent(intent_name) and speech_text:
+                    custom_intent_speech = speech_text
 
                 if last_intent_result is None:
                     last_intent_result = intent.IntentResponse(language=language)
@@ -835,50 +1187,28 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                 "failed": [],
             }
 
-            entity_domain = devices[0].split(".")[0]
-            service_target = get_service_call(intent_name, entity_domain)
-
             # GO through devices
             for entity_id in devices:
-                if service_target is not None:
-                    service_domain, service_name = service_target
-                    service_data = self._extract_service_payload(slots)
-                    service_data["entity_id"] = entity_id
+                service_data = self._extract_service_payload(slots)
 
-                    try:
-                        return_response = entity_id.startswith("script.")
-                        service_result = await self.hass.services.async_call(
-                            service_domain,
-                            service_name,
-                            service_data,
-                            blocking=True,
-                            return_response=return_response,
-                        )
+                try:
+                    if entity_id.startswith("script."):
+                        speech = await self._async_run_script(entity_id, service_data, user_input.context)
+                        _LOGGER.debug("Executed script %s with %s", entity_id, service_data)
+                        intent_entry["response_type"] = "action_done"
+                        if speech:
+                            script_response_text = speech
+                    else:
+                        service_domain, service_name = service_target
+                        service_data["entity_id"] = entity_id
+                        await self.hass.services.async_call(service_domain, service_name, service_data, blocking=True)
                         _LOGGER.debug("Bypassed intent pipeline. Fired service %s.%s with %s", service_domain, service_name, service_data)
                         intent_entry["response_type"] = "action_done"
 
-                        if return_response and service_result:
-                            # Common shapes: plain string, or dict with a useful key
-                            if isinstance(service_result, str) and service_result.strip():
-                                script_response_text = service_result.strip()
-                            elif isinstance(service_result, dict):
-                                # Prefer explicit conversation-style keys first
-                                for key in ("speech", "text", "message", "response"):
-                                    val = service_result.get(key)
-                                    if isinstance(val, str) and val.strip():
-                                        script_response_text = val.strip()
-                                        break
-                                # Fallback: first non-empty string value
-                                if script_response_text is None:
-                                    for v in service_result.values():
-                                        if isinstance(v, str) and v.strip():
-                                            script_response_text = v.strip()
-                                            break
-
-                    except Exception as err:
-                        _LOGGER.error("Direct execution fallback failed for %s: %s", entity_id, err)
-                        intent_entry["response_type"] = "error"
-                        continue
+                except Exception as err:
+                    _LOGGER.error("Direct execution fallback failed for %s: %s", entity_id, err)
+                    intent_entry["response_type"] = "error"
+                    continue
 
                 # Get entity
                 is_success, entity = await self.async_get_entity(entity_id, common_name)
@@ -895,23 +1225,20 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                 last_intent_result.response_type = intent.IntentResponseType.ACTION_DONE
 
         # Send per-intent results back to the NLU engine to generate output text
-        if script_response_text:
-            final_speech = script_response_text
-        elif session_id:
+        # Priority: script response > custom intent response > NLU-generated response
+        # The response request is always sent (for logging), with the custom response text included if one exists.
+        custom_speech = script_response_text or custom_intent_speech
+        nlu_speech = ""
+        if session_id:
             try:
-                final_speech = await self._async_send_response(
-                    session_id,
-                    intents_context,
-                )
+                nlu_speech = await self._async_send_response(session_id, intents_context, custom_speech)
             except (OSError, asyncio.TimeoutError) as err:
                 _LOGGER.error("Failed to get response text from Sophia NLU: %s", err)
-                final_speech = ""
             except Exception as err:
                 _LOGGER.exception("Error getting response text from Sophia NLU")
-                final_speech = ""
         else:
             _LOGGER.warning("No session_id in NLU response; cannot generate output text")
-            final_speech = ""
+        final_speech = custom_speech or nlu_speech
 
         # Finish up: set the output text and return the conversation result to HA
         if last_intent_result is not None:
