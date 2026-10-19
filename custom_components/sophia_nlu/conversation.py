@@ -51,7 +51,7 @@ async def async_setup_entry(
     entity_reg = er.async_get(hass)
     existing_id = entity_reg.async_get_entity_id("conversation", DOMAIN, config_entry.entry_id)
     if existing_id == f"conversation.{DOMAIN}":
-        entity_reg.async_update_entity(existing_id, new_entity_id="conversation.sophia_nlu")
+        entity_reg.async_update_entity(existing_id, new_entity_id="conversation.sophia_nlu_engine")
 
     entity = SophiaNLUConversationEntity(config_entry)
     if yaml_file:
@@ -1165,9 +1165,19 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
             # Fallback to standard HA intent handling if no service mapping exists
             if service_target is None:
                 _LOGGER.debug("No service mapping for %s + %s, falling back to standard intent handling", intent_name, entity_domain)
+                # HA matches the name slot against the full entity name (device name + entity name), which the NLU engine's short name may not equal; HA also accepts an entity_id as the name, so pass the resolved one.
+                if "name" in slots:
+                    slots["name"] = {"value": devices[0]}
                 intent_entry, speech_text = await self.async_handle_standard_intent(
                     intent_name, slots, user_input
                 )
+                # Tomorrow's forecast is not part of the weather entity state, so replace the current conditions with a weather.get_forecasts service call
+                if intent_name == "HassGetWeather" and slots.get("time", {}).get("value") == "tomorrow":
+                    forecast_success: list[dict[str, Any]] = []
+                    for entry in intent_entry.get("success", []):
+                        is_success, entry = await self._async_apply_tomorrow_forecast(entry.get("id") or devices[0], entry)
+                        (forecast_success if is_success else intent_entry.setdefault("failed", [])).append(entry)
+                    intent_entry["success"] = forecast_success
                 intents_context.append(intent_entry)
 
                 # Capture speech for custom intents
@@ -1212,8 +1222,6 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
 
                 # Get entity
                 is_success, entity = await self.async_get_entity(entity_id, common_name)
-                if is_success and intent_name == "HassGetWeather" and slots.get("time", {}).get("value") == "tomorrow":
-                    is_success, entity = await self._async_apply_tomorrow_forecast(entity_id, entity)
                 if is_success:
                     intent_entry["success"].append(entity)
                 else:
