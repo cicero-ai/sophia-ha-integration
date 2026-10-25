@@ -1008,7 +1008,13 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
             results = await self._async_send_to_nlu(
                 text, conversation_id, language, is_reply, user_input.device_id
             )
-        except (OSError, asyncio.TimeoutError) as err:
+        except asyncio.TimeoutError:
+            _LOGGER.error("Sophia NLU at %s:%s did not respond in time", self._host, self._port)
+            response.async_set_speech("Sorry, the NLU engine took too long to respond.")
+            return conversation.ConversationResult(
+                response=response, conversation_id=conversation_id
+            )
+        except OSError as err:
             _LOGGER.error(
                 "Failed to connect to Sophia NLU at %s:%s: %s",
                 self._host,
