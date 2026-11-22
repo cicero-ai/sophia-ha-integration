@@ -7,12 +7,13 @@ import dataclasses
 import json
 import logging
 import time
+from collections.abc import Callable
 from datetime import date
 from typing import Any, Literal
 
 from homeassistant.components import conversation
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, State
+from homeassistant.core import Event, HomeAssistant, State, callback
 from homeassistant.helpers import (
     area_registry as ar,
     entity_registry as er,
@@ -24,6 +25,7 @@ from homeassistant.helpers import (
 
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import dt as dt_util, ulid
 
 from .const import CONF_HOST, CONF_PORT, DOMAIN, get_service_call, is_standard_intent
@@ -38,6 +40,110 @@ ALARM_DOMAIN = "alarm_control_panel"
 ALARM_INTENTS = frozenset(["HassAlarmSetMode", "HassAlarmDisarm", "HassAlarmTrigger"])
 ALARM_FIXED_SERVICES: dict[str, str] = {"HassAlarmDisarm": "alarm_disarm", "HassAlarmTrigger": "alarm_trigger"}
 ALARM_MODE_SERVICES: dict[str, str] = {"home": "alarm_arm_home", "away": "alarm_arm_away", "night": "alarm_arm_night", "vacation": "alarm_arm_vacation", "custom_bypass": "alarm_arm_custom_bypass", "custom": "alarm_arm_custom_bypass"}
+
+# Max seconds to wait for a device to report its new state after a service call (covers device failures / offline devices)
+SETTLE_TIMEOUT = 1.75
+
+
+def _light_brightness_pct(state_obj: State) -> int | None:
+    """Return a light's brightness as a rounded percent, or None if it has no brightness attribute."""
+    raw = state_obj.attributes.get("brightness")
+    if raw is None:
+        return None
+    try:
+        return round(float(raw) / 255.0 * 100.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_settle_predicate(service_domain: str, service_data: dict[str, Any], before: State | None) -> Callable[[State], bool] | None:
+    """Return a predicate that is True once the entity has reported the result of the service call, or None if there's nothing worth waiting for.
+
+    Some integrations (Zigbee, Z-Wave, Matter, cloud) only update the HA state machine when the device confirms, which can be after the blocking service call has already returned.  Reading the state straight away would then return the previous value.
+    Only brightness changes on lights are handled for now.
+    """
+    if service_domain != "light" or before is None:
+        return None
+    if before.state in ("unavailable", "unknown") or before.attributes.get("assumed_state"):
+        return None
+
+    # Absolute brightness: settled when the reported brightness is at (or within 1% of) the target, or the light is off for 0%
+    if "brightness_pct" in service_data:
+        try:
+            target = int(service_data["brightness_pct"])
+        except (TypeError, ValueError):
+            return None
+
+        def absolute_settled(state_obj: State) -> bool:
+            if target <= 0:
+                return state_obj.state == "off"
+            pct = _light_brightness_pct(state_obj)
+            return state_obj.state == "on" and pct is not None and abs(pct - target) <= 1
+
+        # Already at the target, so no state change will ever arrive
+        return None if absolute_settled(before) else absolute_settled
+
+    # Relative brightness: the target is unknown (clamping / device quantization), so settled means the reported state changed
+    if "brightness_step_pct" in service_data:
+        try:
+            step = int(service_data["brightness_step_pct"])
+        except (TypeError, ValueError):
+            return None
+
+        before_pct = _light_brightness_pct(before)
+        if step < 0 and before.state == "off":
+            return None
+        if step > 0 and before_pct is not None and before_pct >= 100:
+            return None
+        before_state = before.state
+
+        def relative_settled(state_obj: State) -> bool:
+            return state_obj.state != before_state or _light_brightness_pct(state_obj) != before_pct
+
+        return relative_settled
+
+    return None
+
+
+class _SettleWatch:
+    """Watches an entity for the state_changed event that shows a service call has taken effect.
+
+    Must be created BEFORE the service call is made, otherwise an event fired during the (blocking) call is missed.  Waiting returns immediately if the state is already settled, so fast devices pay no extra latency.
+    """
+
+    def __init__(self, hass: HomeAssistant, entity_id: str, predicate: Callable[[State], bool], timeout: float = SETTLE_TIMEOUT) -> None:
+        self._hass = hass
+        self._entity_id = entity_id
+        self._predicate = predicate
+        self._timeout = timeout
+        self._done = asyncio.Event()
+        self._unsub: Callable[[], None] | None = async_track_state_change_event(hass, [entity_id], self._on_change)
+
+    @callback
+    def _on_change(self, event: Event) -> None:
+        new_state = event.data.get("new_state")
+        if new_state is not None and self._predicate(new_state):
+            self._done.set()
+
+    async def wait(self) -> bool:
+        """Wait for the settled state.  Returns False if it timed out."""
+        current = self._hass.states.get(self._entity_id)
+        if current is not None and self._predicate(current):
+            return True
+
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(self._done.wait(), timeout=self._timeout)
+        except asyncio.TimeoutError:
+            _LOGGER.debug("%s did not report a settled state within %.2fs, using current state", self._entity_id, self._timeout)
+            return False
+        _LOGGER.debug("%s settled after %.3fs", self._entity_id, time.monotonic() - started)
+        return True
+
+    def cancel(self) -> None:
+        if self._unsub is not None:
+            self._unsub()
+            self._unsub = None
 
 
 async def async_setup_entry(
@@ -71,6 +177,7 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
     _attr_has_entity_name = True
     _attr_name = None
     _attr_supports_streaming = False
+    _attr_supported_features = conversation.ConversationEntityFeature.CONTROL
 
     def __init__(self, entry: ConfigEntry) -> None:
         """Initialize the entity."""
@@ -1206,6 +1313,7 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
             # GO through devices
             for entity_id in devices:
                 service_data = self._extract_service_payload(slots)
+                settle_watch: _SettleWatch | None = None
 
                 try:
                     if entity_id.startswith("script."):
@@ -1217,14 +1325,27 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                     else:
                         service_domain, service_name = service_target
                         service_data["entity_id"] = entity_id
+
+                        # Start watching before the call so a fast state update isn't missed
+                        settle_predicate = _build_settle_predicate(service_domain, service_data, self.hass.states.get(entity_id))
+                        if settle_predicate is not None:
+                            settle_watch = _SettleWatch(self.hass, entity_id, settle_predicate)
+
                         await self.hass.services.async_call(service_domain, service_name, service_data, blocking=True)
                         _LOGGER.debug("Bypassed intent pipeline. Fired service %s.%s with %s", service_domain, service_name, service_data)
                         intent_entry["response_type"] = "action_done"
+
+                        # Wait (up to SETTLE_TIMEOUT) for the device to report its new state; returns instantly if it already has
+                        if settle_watch is not None:
+                            await settle_watch.wait()
 
                 except Exception as err:
                     _LOGGER.error("Direct execution fallback failed for %s: %s", entity_id, err)
                     intent_entry["response_type"] = "error"
                     continue
+                finally:
+                    if settle_watch is not None:
+                        settle_watch.cancel()
 
                 # Get entity
                 is_success, entity = await self.async_get_entity(entity_id, common_name)
