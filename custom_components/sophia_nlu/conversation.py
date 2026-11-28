@@ -41,6 +41,12 @@ ALARM_INTENTS = frozenset(["HassAlarmSetMode", "HassAlarmDisarm", "HassAlarmTrig
 ALARM_FIXED_SERVICES: dict[str, str] = {"HassAlarmDisarm": "alarm_disarm", "HassAlarmTrigger": "alarm_trigger"}
 ALARM_MODE_SERVICES: dict[str, str] = {"home": "alarm_arm_home", "away": "alarm_arm_away", "night": "alarm_arm_night", "vacation": "alarm_arm_vacation", "custom_bypass": "alarm_arm_custom_bypass", "custom": "alarm_arm_custom_bypass"}
 
+# Vacuum clean_area and media search intents need more than a single service call with the slots passed straight through
+VACUUM_DOMAIN = "vacuum"
+VACUUM_CLEAN_AREA_FEATURE = 16384
+MEDIA_PLAYER_DOMAIN = "media_player"
+MEDIA_SEARCH_FEATURES = 4194304 | 512  # SEARCH_MEDIA | PLAY_MEDIA
+
 # Max seconds to wait for a device to report its new state after a service call (covers device failures / offline devices)
 SETTLE_TIMEOUT = 1.75
 
@@ -371,20 +377,9 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
         return msg
 
     def _is_reply(self, conversation_id: str) -> bool:
-        """Return True if this turn should be flagged as a reply.
-
-        True if the previous turn had continue_conversation=True, or if the
-        previous turn for this conversation_id was received within the last 30 seconds.
-        """
+        """Return True if this turn should be flagged as a reply, ie. the previous turn for this conversation_id had continue_conversation=True."""
         session = self._conversation_sessions.get(conversation_id)
-        if session is None:
-            return False
-        if session.get("continue_conversation"):
-            return True
-        last_ts = session.get("last_ts")
-        if last_ts is not None and (time.monotonic() - last_ts) <= 30.0:
-            return True
-        return False
+        return bool(session and session.get("continue_conversation"))
 
     def _update_session(
         self, conversation_id: str, continue_conversation: bool
@@ -435,11 +430,15 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
             _LOGGER.error("%s intent error: %s", intent_name, err)
             respond_result = intent.IntentResponse(language=language)
 
+        # The server sends HassClarification / HassClarificationArea as a HassRespond, with continue_conversation flagged within the metadata
+        metadata = results[0].get("data", {}).get("metadata") or {}
+        continue_conversation = bool(metadata.get("continue_conversation")) or intent_name in ("HassClarification", "HassClarificationArea")
+
         respond_result.async_set_speech(respond_text or "Done.")
         return conversation.ConversationResult(
             response=respond_result,
             conversation_id=conversation_id,
-            continue_conversation=(intent_name == "HassClarification"),
+            continue_conversation=continue_conversation,
         )
 
     def _resolve_entities_from_slots(self, slots: dict[str, Any]) -> list[str]:
@@ -636,9 +635,8 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
             # Volume & Volume Steps (e.g., media players)
             elif key in ("volume", "volume_level"):
                 try:
-                    # HA volume_level expects float between 0.0 and 1.0
-                    raw_val = float(val)
-                    payload["volume_level"] = raw_val / 100.0 if raw_val > 1.0 else raw_val
+                    # The slot is always a 0-100 percentage; HA volume_level expects a float between 0.0 and 1.0
+                    payload["volume_level"] = max(0.0, min(1.0, float(val) / 100.0))
                 except ValueError:
                     pass
 
@@ -1095,6 +1093,141 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
             intent_entry["failed"].append(entity)
         return intent_entry
 
+    def _entity_area_id(self, entity_id: str) -> str | None:
+        """Return the area an entity is in, directly or via its device."""
+        entry = er.async_get(self.hass).async_get(entity_id)
+        if entry is None:
+            return None
+        if entry.area_id:
+            return entry.area_id
+        if entry.device_id:
+            device = dr.async_get(self.hass).async_get(entry.device_id)
+            return device.area_id if device else None
+        return None
+
+    def _find_capable_entities(self, slots: dict[str, Any], domain: str, features: int, ignore_location: bool) -> list[str]:
+        """Resolve entities for the slots in the given domain that support all the given features and are not unavailable.
+
+        ignore_location drops the area / floor slots, for intents where those are service parameters rather than a place to look for the device.
+        """
+        resolve_slots = {k: v for k, v in slots.items() if not (ignore_location and k in ("area", "floor"))}
+        resolve_slots["domain"] = {"value": domain}
+        result: list[str] = []
+        for entity_id in self._resolve_entities_from_slots(resolve_slots):
+            state_obj = self.hass.states.get(entity_id)
+            if state_obj is None or entity_id.split(".", 1)[0] != domain or state_obj.state in ("unavailable", "unknown"):
+                continue
+            if (int(state_obj.attributes.get("supported_features") or 0) & features) != features:
+                continue
+            result.append(entity_id)
+        return result
+
+    async def _async_finish_entities(self, intent_entry: dict[str, Any], entity_ids: list[str], common_name: str | None, extra: dict[str, Any] | None = None) -> None:
+        """Read back the entities after a service call and sort them into the success / failed lists."""
+        for entity_id in entity_ids:
+            is_success, entity = await self.async_get_entity(entity_id, common_name if len(entity_ids) == 1 else None)
+            if extra:
+                entity.update(extra)
+            intent_entry["success" if is_success else "failed"].append(entity)
+
+    async def _async_handle_vacuum_clean_area(self, slots: dict[str, Any], context: Any) -> dict[str, Any]:
+        """Execute HassVacuumCleanArea via vacuum.clean_area.  The area slot is the area to clean (cleaning_area_id), not where the vacuum lives."""
+        intent_entry: dict[str, Any] = {"response_type": "action_done", "success": [], "failed": []}
+
+        area_name = str(slots.get("area", {}).get("value") or "").strip()
+        if not area_name:
+            _LOGGER.error("HassVacuumCleanArea received without an area slot")
+            intent_entry.update({"response_type": "error", "error": "missing_area"})
+            return intent_entry
+
+        areas = list(intent.find_areas(area_name, ar.async_get(self.hass)))
+        if not areas:
+            _LOGGER.error("HassVacuumCleanArea: no area named '%s'", area_name)
+            intent_entry.update({"response_type": "error", "error": "invalid_area"})
+            return intent_entry
+        area_ids = [a.id for a in areas]
+
+        vacuums = self._find_capable_entities(slots, VACUUM_DOMAIN, VACUUM_CLEAN_AREA_FEATURE, ignore_location=True)
+        if len(vacuums) > 1 and "name" not in slots and "entity_id" not in slots:
+            # No specific vacuum requested, so prefer the ones in the area being cleaned
+            in_area = [v for v in vacuums if self._entity_area_id(v) in area_ids]
+            vacuums = in_area or vacuums
+        if not vacuums:
+            _LOGGER.error("HassVacuumCleanArea: no vacuum supporting clean_area found")
+            intent_entry.update({"response_type": "error", "error": "no_match"})
+            return intent_entry
+
+        try:
+            await self.hass.services.async_call(VACUUM_DOMAIN, "clean_area", {"entity_id": vacuums, "cleaning_area_id": area_ids}, blocking=True, context=context)
+            _LOGGER.debug("Fired vacuum.clean_area for %s areas %s", vacuums, area_ids)
+        except Exception as err:
+            _LOGGER.error("vacuum.clean_area failed for %s: %s", vacuums, err)
+            intent_entry.update({"response_type": "error", "error": self._normalize_intent_error(err)})
+            return intent_entry
+
+        await self._async_finish_entities(intent_entry, vacuums, slots.get("common_name", {}).get("value"))
+        return intent_entry
+
+    @staticmethod
+    def _media_field(item: Any, key: str) -> Any:
+        return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+
+    async def _async_handle_media_search_and_play(self, slots: dict[str, Any], context: Any) -> dict[str, Any]:
+        """Execute HassMediaSearchAndPlay: media_player.search_media, then media_player.play_media with the first result."""
+        intent_entry: dict[str, Any] = {"response_type": "action_done", "success": [], "failed": []}
+
+        search_query = str(slots.get("search_query", {}).get("value") or "").strip()
+        if not search_query:
+            _LOGGER.error("HassMediaSearchAndPlay received without a search_query slot")
+            intent_entry.update({"response_type": "error", "error": "missing_search_query"})
+            return intent_entry
+
+        players = self._find_capable_entities(slots, MEDIA_PLAYER_DOMAIN, MEDIA_SEARCH_FEATURES, ignore_location=False)
+        if len(players) > 1:
+            # Prefer a player that is actually on, and use a single one like HA does
+            players = [p for p in players if self.hass.states.get(p).state != "off"] or players
+        if not players:
+            _LOGGER.error("HassMediaSearchAndPlay: no media player supporting search and play found")
+            intent_entry.update({"response_type": "error", "error": "no_match"})
+            return intent_entry
+        entity_id = players[0]
+
+        search_data: dict[str, Any] = {"entity_id": entity_id, "search_query": search_query}
+        media_class = slots.get("media_class", {}).get("value")
+        if media_class:
+            search_data["media_filter_classes"] = [media_class]
+
+        try:
+            search_response = await self.hass.services.async_call(MEDIA_PLAYER_DOMAIN, "search_media", search_data, blocking=True, context=context, return_response=True)
+        except Exception as err:
+            _LOGGER.error("media_player.search_media failed for %s: %s", entity_id, err)
+            intent_entry.update({"response_type": "error", "error": self._normalize_intent_error(err)})
+            return intent_entry
+
+        entity_response = (search_response or {}).get(entity_id)
+        results = self._media_field(entity_response, "result") if entity_response is not None else None
+        if not results:
+            _LOGGER.debug("HassMediaSearchAndPlay: no results for '%s' on %s", search_query, entity_id)
+            is_success, entity = await self.async_get_entity(entity_id, slots.get("common_name", {}).get("value"))
+            entity["reason"] = "media_not_found"
+            intent_entry["failed"].append(entity)
+            return intent_entry
+
+        first = results[0]
+        content_id = self._media_field(first, "media_content_id")
+        content_type = self._media_field(first, "media_content_type")
+        try:
+            await self.hass.services.async_call(MEDIA_PLAYER_DOMAIN, "play_media", {"entity_id": entity_id, "media_content_id": content_id, "media_content_type": content_type}, blocking=True, context=context)
+            _LOGGER.debug("Fired media_player.play_media for %s with %s (%s)", entity_id, content_id, content_type)
+        except Exception as err:
+            _LOGGER.error("media_player.play_media failed for %s: %s", entity_id, err)
+            intent_entry.update({"response_type": "error", "error": self._normalize_intent_error(err)})
+            return intent_entry
+
+        media_info = {"title": self._media_field(first, "title"), "media_class": str(self._media_field(first, "media_class") or ""), "media_content_type": str(content_type or "")}
+        await self._async_finish_entities(intent_entry, [entity_id], slots.get("common_name", {}).get("value"), {"media": media_info})
+        return intent_entry
+
     async def async_process(
         self, user_input: conversation.ConversationInput
     ) -> conversation.ConversationResult:
@@ -1217,6 +1350,15 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                     last_intent_result.response_type = intent.IntentResponseType.ACTION_DONE
                 continue
 
+            # Vacuum area cleaning and media search need multi-step handling
+            if intent_name in ("HassVacuumCleanArea", "HassMediaSearchAndPlay"):
+                handler = self._async_handle_vacuum_clean_area if intent_name == "HassVacuumCleanArea" else self._async_handle_media_search_and_play
+                intents_context.append(await handler(slots, user_input.context))
+                if last_intent_result is None:
+                    last_intent_result = intent.IntentResponse(language=language)
+                    last_intent_result.response_type = intent.IntentResponseType.ACTION_DONE
+                continue
+
             if not is_standard_intent(intent_name):
                 # Custom intents with an intent_script handler fall through to
                 # standard HA handling below (ScriptIntentHandler executes the
@@ -1325,6 +1467,8 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
                     else:
                         service_domain, service_name = service_target
                         service_data["entity_id"] = entity_id
+                        if intent_name in ("HassMediaPlayerMute", "HassMediaPlayerUnmute"):
+                            service_data["is_volume_muted"] = intent_name == "HassMediaPlayerMute"
 
                         # Start watching before the call so a fast state update isn't missed
                         settle_predicate = _build_settle_predicate(service_domain, service_data, self.hass.states.get(entity_id))

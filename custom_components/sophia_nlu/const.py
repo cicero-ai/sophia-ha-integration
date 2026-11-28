@@ -35,7 +35,7 @@ INTENT_SERVICE_MAP: dict[str, tuple[str | None, str | None]] = {
     # --- vacuum ---
     "HassVacuumStart":             ("vacuum", "start"),
     "HassVacuumReturnToBase":      ("vacuum", "return_to_base"),
-    "HassVacuumCleanArea":         ("vacuum", "start"),
+    "HassVacuumCleanArea":         ("vacuum", "clean_area"),  # handled in conversation.py, needs cleaning_area_id
 
     # --- media_player ---
     "HassMediaPause":              ("media_player", "media_pause"),
